@@ -46,6 +46,14 @@ To enroll a cut for any game's own module:
 - **Found on:** [DRAGON QUEST XI S: Echoes of an Elusive Age – Definitive Edition](../../dm/games/01006C300E9F0000/README.md) `main+0x2dd8cd0`.
 - **Note:** before fixing one site, a census of all of them saves a run per site: a copy of `patch_nso.py` whose assert prints and continues found this one alone among the 25,508 `x18` sites. That `main` has no unwind entries for its first 70 MB, so the rewriter disassembles them as one function and takes 6 minutes (see [Long functions analysed in pieces](#long-functions-analysed-in-pieces)).
 
+### Index masked in the block that branches to the dispatch
+
+- **Symptom:** `jump table <addr>` assertion in a Unity / IL2CPP `main` whose dispatch checks a fresh mask of another register than the one it indexes with.
+- **Cause:** the dispatch block masks the source again for its bounds check, while the index register was masked from the same source in the block that branches to it: `and x6,x17,#0x7ff; ubfx w18,w17,#0xb,#2; cbz w18,L`, then `L: and w18,w17,#0x7ff; cmp w18,#3; b.hi; ldrsw x18,[x27,x6,lsl #2]; add x18,x18,x27; br x18`, with the base `x27` from an `adrp` + `add` about 1,500 instructions back. A sibling builds its base inside the block and moves registers before the `br` (`adrp x24` + `add`, a `mov`, the load and the add, then 10 register moves). No copy links the two registers, so `jump_offsets` and `check_before_copy` find no check.
+- **Fix:** `jump_masked_pred` accepts the site when the block (at most 32 instructions) is `and wC,wS,#M; cmp wC,#N; b.hi` followed by straight-line code holding the load and the add; it is entered by branches alone (the instruction before it is `b` / `br` / `ret`, no branch lands inside it after its `and`, no jump table already resolved in the function reaches it); every branch into it follows, on a straight-line path, `and xI,xS,#M` with the check's source and mask; and the index, the base and `x18` are unchanged where the form needs them. The base is found as `far_base` finds it and every target must be an instruction of the function. It runs only after every other form has failed.
+- **Found on:** FINAL FANTASY CRYSTAL CHRONICLES Remastered Edition 1.0.0 (Unity 2018.4.2f1, SDK 8.2.1) `main+0x2d103cc` and `+0x2d10590`, in one function; the same form in its update 1.0.3.
+- **Check:** it runs only where the rewriter asserted before, so modules that rewrote before come out the same; other games' modules were not on hand to compare.
+
 ### Offset table base set far back in the function
 
 - **Symptom:** `jump table <addr>` assertion on an offset table whose base was set far back (`cmp w18,#5; b.hi; ldrsw x18,[x24,x18,lsl #2]; add x18,x18,x24; br x18`).
