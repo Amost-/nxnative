@@ -1,6 +1,8 @@
 // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard and controllers → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // The window is fullscreen-capable (the green button and ⌃⌘F); DM_FULLSCREEN=1 starts it that way. ⌘Q quits; the left mouse button is the touchscreen.
+// Cheats (hle_cheats.c): the Cheats menu's rows toggle, reload (⌘R) and open the cheats folder; its first item "Show Cheats
+// Window" (⌘⇧C) opens a Cheats panel, a utility panel beside the game with one checkbox per cheat (see the code below).
 // Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
 // Controllers: buttons by position as on the iPhone (right A, bottom B, top X, left Y), shoulders L R, triggers ZL ZR, Menu + Options −, both sticks and their presses.
 // Each controller is a player of its own (local co-op): the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (pad_slots.h);
@@ -247,18 +249,48 @@ static void *guest_tramp(void *p) {
 // Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
 __attribute__((constructor)) static void hud_env(void) { front_hud_env(); }
 
+// The Cheats panel (the menu's "Show Cheats Window", ⌘⇧C): a utility NSPanel that stays open beside the game window, one
+// checkbox per cheat, toggles applied live, scrollable. It never takes the key window from the game (becomesKeyOnlyIfNeeded,
+// shown with orderFront), so the game keeps the keyboard and the controllers and gets no focus-lost; created once lazily and
+// kept for the process's lifetime, closed only to hide (its place and size survive in the frame autosave "DmCheatsPanel").
+// Every row comes from the C API (dm_cheat* in dm.h); the class holds no cheats state of its own beyond the controls, and one
+// refresh method keeps the controls (and the header) in step with hle_cheats.c: the rows rebuilt when the list of cheats
+// changes (a reload), only updated when it does not (a click, a run-time kill). A Select All / Deselect All row under
+// the header flips every plain cheat in one go (masters and run-time-disabled rows are never touched; its two buttons
+// enable only while some plain cheat is off / on). A ~1 s timer runs only while the panel is
+// visible to catch what the VM turns off between interactions; closing the panel (a hide) or deactivating the app stops it,
+// so nothing ticks while the panel is away
+@interface DmCheatsPanel : NSObject <NSWindowDelegate>
+- (void)show;      // create the panel if needed, order it front (not key) and refresh
+- (void)refresh;   // the one refresh for every trigger: shown, checkbox click, Reload, a Cheats-menu toggle, the 1 s timer
+@end
+static DmCheatsPanel *g_cheats_panel;   // created on the first Show Cheats Window, kept for the process's lifetime
+
+// "Open cheats folder": the menu's and the panel's action, one helper — create the folder when missing, then reveal it in Finder
+static void cheats_open_folder(void) {
+    const char *dir = dm_cheats_dir_path();
+    if (dir && *dir) { mkdir(dir, 0755); [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:@(dir)]]; }
+}
+
 // The Cheats menu of the game window (hle_cheats.c's rows, only meaningful with a window): rebuilt on every open, so the
 // loaded file's state, the menu's toggles and the cheats the VM disabled at run time are what the player sees. Rows: one
 // per cheat (a plain row carries its checkmark and toggles on click; a master code is always on and not clickable; a
 // disabled row shows its reason, "(unsupported opcode N)" or the run-time "(off: ...)"), the disabled rows the brief
 // names when no file of this build is loaded — "No cheats for build ..." plus each other build's .txt in the folder —
 // and the two commands at the bottom, still usable when no file matches yet, so a file dropped in while playing needs
-// no re-launch. All rows come from the C API; this file holds no cheats state
+// no re-launch. All rows come from the C API; this file holds no cheats state. The menu's first item, "Show Cheats
+// Window" (⌘⇧C, then a separator), opens the Cheats panel (DmCheatsPanel below): the menu keeps working as it does,
+// and a toggle here also refreshes the panel when one exists, so the two never disagree
 @interface DmCheatsMenuDelegate : NSObject <NSMenuDelegate>
 @end
 @implementation DmCheatsMenuDelegate
 - (void)menuNeedsUpdate:(NSMenu *)menu {
     [menu removeAllItems];
+    // "Show Cheats Window" (⌘⇧C) first, then a separator: the panel opens over the game without taking its key status
+    NSMenuItem *sh = [menu addItemWithTitle:@"Show Cheats Window" action:@selector(showPanel:) keyEquivalent:@"c"];
+    sh.target = self;
+    sh.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;   // ⌘⇧C (the plain "c" already maps ZR)
+    [menu addItem:NSMenuItem.separatorItem];
     for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
         const char *nm = dm_cheat_name_at(i), *why = dm_cheat_why_at(i);
         NSMenuItem *it = [menu addItemWithTitle:why && *why ? [NSString stringWithFormat:@"%s%s", nm, why] : [NSString stringWithUTF8String:nm] action:nil keyEquivalent:@""];
@@ -287,15 +319,356 @@ __attribute__((constructor)) static void hud_env(void) { front_hud_env(); }
 - (void)toggleCheat:(NSMenuItem *)it {
     dm_cheat_toggle((int)it.tag);
     it.state = dm_cheat_on_at((int)it.tag) ? NSControlStateValueOn : NSControlStateValueOff;   // The new state right now; a run-time [RED] kill shows its reason when the menu next opens
+    if (g_cheats_panel) [g_cheats_panel refresh];   // the panel (if created) follows the menu so the two never disagree; its visibility is checked there
 }
-- (void)reloadCheats:(NSMenuItem *)it { (void)it; dm_cheats_reload(); }
-- (void)openCheatsFolder:(NSMenuItem *)it {   // The brief: the action creates the folder when it is missing, then reveals it
+- (void)reloadCheats:(NSMenuItem *)it { (void)it; dm_cheats_reload(); if (g_cheats_panel) [g_cheats_panel refresh]; }
+- (void)openCheatsFolder:(NSMenuItem *)it { (void)it; cheats_open_folder(); }
+// Lazily create the panel on the first Show Cheats Window (it is kept for the process's lifetime) and order it front:
+// orderFront keeps the game the key window
+- (void)showPanel:(NSMenuItem *)it {
     (void)it;
-    const char *dir = dm_cheats_dir_path();
-    if (dir && *dir) { mkdir(dir, 0755); [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:@(dir)]]; }
+    if (!g_cheats_panel) g_cheats_panel = [DmCheatsPanel new];   // created here, on the first Show Cheats Window
+    [g_cheats_panel show];
 }
 @end
 static DmCheatsMenuDelegate *g_cheats_menu;   // NSMenu keeps its delegate unretained
+
+// The scroll view's document view: flipped, so the stack view's rows start at the top and the scroll position counts
+// downward like the rows (unflipped, everything would sit at the bottom of the document view)
+@interface DmCheatsDocView : NSView @end
+@implementation DmCheatsDocView
+- (BOOL)isFlipped { return YES; }
+@end
+
+// The row's whole title, the same string the menu's row carries: the name, plus the run-time reason when there is one,
+// or "— master code (always on)" for a master code
+static NSString *cheat_row_title(int i) {
+    const char *nm = dm_cheat_name_at(i), *why = dm_cheat_why_at(i);
+    int kind = dm_cheat_kind_at(i);
+    if (kind == 1) return [NSString stringWithFormat:@"%s — master code (always on)", nm];
+    return why && *why ? [NSString stringWithFormat:@"%s%s", nm, why] : [NSString stringWithUTF8String:nm];
+}
+
+// The row's state as hle_cheats.c has it: a plain cheat carries its own on state, a master code is always on, and a
+// disabled row (unsupported opcode, malformed, or killed at run time) is off, its checkbox unchecked and not clickable
+static NSControlStateValue cheat_row_state(int i) {
+    int kind = dm_cheat_kind_at(i);
+    return kind == 1 || (kind == 0 && dm_cheat_on_at(i)) ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
+@implementation DmCheatsPanel {
+    NSPanel *_panel;              // created once in show, kept for the process's lifetime
+    NSTextField *_header;         // the one-line status line above the rows
+    NSScrollView *_scroll;
+    NSStackView *_stack;          // the rows (vertical, leading alignment), inside _doc
+    NSView *_doc;                 // the flipped document view the stack is pinned to
+    NSButton *_openFolder;        // disabled while dm_cheats_dir_path() is empty
+    NSStackView *_selRow;         // the Select All / Deselect All row, under the header, above the scrolled list
+    NSButton *_selectAll;         // enabled while some plain cheat is off
+    NSButton *_deselectAll;       // enabled while some plain cheat is on
+    NSMutableArray<NSButton *> *_rows;    // the shown checkboxes, index = cheat index, kept to update them in place
+    NSString *_rows_sig;          // what the rows on screen were built from: count + names + other builds; a change rebuilds
+    NSTimer *_refreshTimer;       // ~1 s, scheduled only while the panel is on screen; invalidated when it hides
+    BOOL _upOnDeactivate;         // the panel was on screen when the app was deactivated: AppKit brings it back on activation
+}
+
+// Create the panel, the content view and the fixed layout once: header, the Select All / Deselect All row, the scroll
+// view with the rows, the bottom row of buttons. refresh fills the rows afterwards (a rebuild on the first fill and
+// after a reload, an update in place otherwise)
+- (void)makePanel {
+    _panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 440, 480)
+                                        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+                                                | NSWindowStyleMaskUtilityWindow
+                                        backing:NSBackingStoreBuffered defer:NO];
+    _panel.title = @"Cheats";
+    _panel.releasedWhenClosed = NO;         // the close button only hides (windowShouldClose): the panel object and its
+                                            // autosaved frame stay for the process's lifetime
+    _panel.floatingPanel = YES;             // above the game window
+    _panel.becomesKeyOnlyIfNeeded = YES;    // a checkbox click never takes the key window (and no focus-lost event): the game keeps keyboard and controllers
+    _panel.collectionBehavior = NSWindowCollectionBehaviorFullScreenAuxiliary;   // shows over the fullscreen game too
+    _panel.frameAutosaveName = @"DmCheatsPanel";   // place and size remembered (fullscreen: macOS 10.13+ keeps one per mode)
+    _panel.minSize = NSMakeSize(320, 200);
+    _panel.delegate = self;                 // windowShouldClose turns the close into a hide
+    // The utility panel hides with the app (hidesOnDeactivate, the default) and comes back by itself: the refresh timer
+    // follows the app's activation (appResignedActive: / appBecameActive:), so a hidden panel is not refreshed
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    [nc addObserver:self selector:@selector(appResignedActive:) name:NSApplicationDidResignActiveNotification object:NSApp];
+    [nc addObserver:self selector:@selector(appBecameActive:) name:NSApplicationDidBecomeActiveNotification object:NSApp];
+    NSView *content = _panel.contentView;
+
+    // Header: the status line, truncated to one line
+    _header = [NSTextField labelWithString:@""];
+    _header.translatesAutoresizingMaskIntoConstraints = NO;
+    _header.lineBreakMode = NSLineBreakByTruncatingTail;
+    [content addSubview:_header];
+
+    // Select All / Deselect All: a leading-aligned row of its own, directly under the header and above the scrolled
+    // list. The bottom row keeps Reload cheats / Open cheats folder: four buttons in one row would not fit the
+    // 320-point minimum width
+    _selectAll = [NSButton buttonWithTitle:@"Select All" target:self action:@selector(selectAllCheats:)];
+    _deselectAll = [NSButton buttonWithTitle:@"Deselect All" target:self action:@selector(deselectAllCheats:)];
+    _selRow = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    _selRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    _selRow.translatesAutoresizingMaskIntoConstraints = NO;
+    _selRow.spacing = 8;
+    [_selRow addArrangedSubview:_selectAll];
+    [_selRow addArrangedSubview:_deselectAll];
+    [content addSubview:_selRow];
+
+    // Rows: a flipped document view with the vertical stack pinned to its top, leading and trailing; the document view's
+    // width is the clip view's, so rows fill the width and only vertical scrolling happens
+    _scroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    _scroll.hasVerticalScroller = YES;
+    _scroll.autohidesScrollers = YES;       // the vertical scroller shows only when it is needed
+    _scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    _doc = [[DmCheatsDocView alloc] initWithFrame:NSZeroRect];
+    _doc.translatesAutoresizingMaskIntoConstraints = NO;
+    _scroll.documentView = _doc;
+    _stack = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    _stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    _stack.alignment = NSLayoutAttributeLeading;
+    _stack.spacing = 4;
+    _stack.edgeInsets = NSEdgeInsetsMake(8, 8, 8, 8);
+    _stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [_doc addSubview:_stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [_stack.topAnchor constraintEqualToAnchor:_doc.topAnchor],
+        [_stack.leadingAnchor constraintEqualToAnchor:_doc.leadingAnchor],
+        [_stack.trailingAnchor constraintEqualToAnchor:_doc.trailingAnchor],
+        [_doc.leadingAnchor constraintEqualToAnchor:_scroll.contentView.leadingAnchor],       // the document starts at the clip view's left edge (otherwise its x is ambiguous)
+        [_doc.widthAnchor constraintEqualToAnchor:_scroll.contentView.widthAnchor],          // no horizontal scrolling: rows fill the clip view's width
+        [_doc.topAnchor constraintEqualToAnchor:_scroll.contentView.topAnchor],              // the clip view scrolls down the document
+        [_doc.bottomAnchor constraintEqualToAnchor:_stack.bottomAnchor],                     // the document is exactly as tall as its rows
+    ]];
+    [content addSubview:_scroll];
+
+    // Bottom row: the two commands, pushed to the bottom edge
+    NSButton *reload = [NSButton buttonWithTitle:@"Reload cheats" target:self action:@selector(reload:)];
+    _openFolder = [NSButton buttonWithTitle:@"Open cheats folder" target:self action:@selector(openFolder:)];
+    NSStackView *bottom = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    bottom.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    bottom.translatesAutoresizingMaskIntoConstraints = NO;
+    bottom.spacing = 8;
+    [bottom addArrangedSubview:reload];
+    [bottom addArrangedSubview:_openFolder];
+    [content addSubview:bottom];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_header.topAnchor constraintEqualToAnchor:content.topAnchor constant:10],
+        [_header.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:8],
+        [_header.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-8],
+        [_selRow.topAnchor constraintEqualToAnchor:_header.bottomAnchor constant:8],
+        [_selRow.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:8],
+        [_selRow.trailingAnchor constraintLessThanOrEqualToAnchor:content.trailingAnchor constant:-8],
+        [_scroll.topAnchor constraintEqualToAnchor:_selRow.bottomAnchor constant:8],
+        [_scroll.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+        [_scroll.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+        [_scroll.bottomAnchor constraintEqualToAnchor:bottom.topAnchor constant:-8],
+        [bottom.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:8],
+        [bottom.trailingAnchor constraintLessThanOrEqualToAnchor:content.trailingAnchor constant:-8],
+        [bottom.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-8],
+    ]];
+    _rows = [NSMutableArray array];
+    _rows_sig = @"";
+}
+
+// "Open cheats folder": the helper shared with the menu (create the folder, reveal it)
+- (void)openFolder:(NSButton *)b { (void)b; cheats_open_folder(); }
+
+// "Reload cheats": re-read the file (hle_cheats.c), then rebuild or update the rows
+- (void)reload:(NSButton *)b { (void)b; dm_cheats_reload(); [self refresh]; }
+
+// Select All / Deselect All: flip every plain cheat (kind 0) that is not already in the wanted state, then one refresh.
+// The loop over dm_cheat_toggle instead of a new bulk call is deliberate: the C API stays as it is, each toggle rewrites
+// <build ID>.enabled once (a few tiny writes), and a cheat pass that runs between two toggles sees a mix for one frame,
+// which is harmless. Masters (kind 1) and disabled cheats (kind 2) are never touched — they have no state to change
+- (void)setPlainCheatsOn:(BOOL)on {
+    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
+        if (dm_cheat_kind_at(i) != 0) continue;
+        if (!!dm_cheat_on_at(i) == on) continue;
+        dm_cheat_toggle(i);
+    }
+    [self refresh];
+}
+
+// The two buttons behind setPlainCheatsOn:.
+- (void)selectAllCheats:(NSButton *)b   { (void)b; [self setPlainCheatsOn:YES]; }
+- (void)deselectAllCheats:(NSButton *)b { (void)b; [self setPlainCheatsOn:NO]; }
+
+// A checkbox click: flip the cheat (hle_cheats.c also rewrites <build ID>.enabled), then refresh — the state comes back
+// from the model, so a click that races a run-time kill leaves the row as hle_cheats.c says
+- (void)cheatClicked:(NSButton *)b {
+    int i = (int)b.tag;
+    if (i >= 0 && i < dm_cheats_ncheats()) dm_cheat_toggle(i);
+    [self refresh];
+}
+
+// The Select All / Deselect All buttons' enable state, recomputed on every refresh (both paths, the row rebuild and the
+// in-place update, pass through it): Select All is enabled while some plain cheat is off, Deselect All while some plain
+// cheat is on; with no plain cheats at all — which also covers no file loaded — both are disabled
+- (void)updateSelectButtons {
+    BOOL someOff = NO, someOn = NO;
+    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
+        if (dm_cheat_kind_at(i) != 0) continue;
+        if (dm_cheat_on_at(i)) someOn = YES; else someOff = YES;
+        if (someOn && someOff) break;
+    }
+    _selectAll.enabled = someOff;
+    _deselectAll.enabled = someOn;
+}
+
+// The header's one line: the cheats folder missing first (the panel says why it is empty), then the counts, then no file
+- (void)fillHeader {
+    const char *dir = dm_cheats_dir_path();
+    if (!dir || !*dir) _header.stringValue = @"Cheats are off: no cheats folder (DM_CHEATS or DM_ROOT is not set)";
+    else if (dm_cheats_found()) _header.stringValue = [NSString stringWithFormat:@"Build %s: %d cheats", dm_cheats_build(), dm_cheats_ncheats()];
+    else _header.stringValue = [NSString stringWithFormat:@"No cheats for build %s", dm_cheats_build()];
+}
+
+// One checkbox row as hle_cheats.c describes cheat i: enabled and clickable when plain, checked but not clickable when
+// master, unchecked and not clickable with its reason when disabled. The whole title is shown truncated in the row and
+// whole in the tooltip, and the horizontal compression is low so a long title never widens the panel
+- (NSButton *)cheatRow:(int)i {
+    int kind = dm_cheat_kind_at(i);
+    NSString *full = cheat_row_title(i);
+    NSButton *b = [NSButton checkboxWithTitle:full target:self action:@selector(cheatClicked:)];
+    b.tag = i;
+    b.enabled = kind == 0;
+    b.state = cheat_row_state(i);
+    b.toolTip = full;
+    ((NSButtonCell *)b.cell).lineBreakMode = NSLineBreakByTruncatingTail;                      // truncate, never push the panel wider
+    [b setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    return b;
+}
+
+// The disabled label naming a .txt of another build of this game
+- (NSTextField *)otherRow:(int)i {
+    NSString *full = [NSString stringWithFormat:@"Cheats for build %s (another version of the game)", dm_cheats_other(i)];
+    NSTextField *l = [NSTextField labelWithString:full];
+    l.textColor = NSColor.secondaryLabelColor;
+    l.lineBreakMode = NSLineBreakByTruncatingTail;
+    l.toolTip = full;
+    [l setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    return l;
+}
+
+// What the rows on screen were built from: the signature rebuilt on every refresh, the rows rebuilt when it differs.
+// Kinds, states and titles are not in it: they change per cheat and the update path carries them in place (a kind change
+// with the name kept — a cheat killed at run time — is an update, not a rebuild)
+- (NSString *)rowsSig {
+    NSMutableString *s = [NSMutableString stringWithFormat:@"%d/%d/", dm_cheats_ncheats(), dm_cheats_nothers()];
+    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) [s appendFormat:@"%s|", dm_cheat_name_at(i)];
+    for (int i = 0, n = dm_cheats_nothers(); i < n; i++) [s appendFormat:@"%s|", dm_cheats_other(i)];
+    return s;
+}
+
+// Take the stack's rows off the screen (every arranged subview, checkboxes and "another version" labels alike, leaves the
+// stack with removeFromSuperview)
+- (void)dropRows {
+    for (NSView *v in [_stack.arrangedSubviews copy]) [v removeFromSuperview];
+    [_rows removeAllObjects];
+}
+
+// Rebuild all rows (a reload, a first fill), keeping the scroll position as far as possible: the viewport top in the
+// document is remembered, then put back after the new rows have laid out, clamped to what the new document still reaches
+- (void)rebuildRows {
+    NSClipView *clip = _scroll.contentView;
+    CGFloat keepY = clip.bounds.origin.y;
+    [self dropRows];
+    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
+        NSButton *b = [self cheatRow:i];
+        [_stack addArrangedSubview:b];
+        [_rows addObject:b];
+    }
+    for (int i = 0, n = dm_cheats_nothers(); i < n; i++) [_stack addArrangedSubview:[self otherRow:i]];
+    _rows_sig = [self rowsSig];
+    if (keepY <= 0) return;   // at the top already: the new rows start at the top too
+    __weak DmCheatsPanel *wself = self;   // one main-queue tick later, not retained by this: the panel may be hidden by then
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DmCheatsPanel *s = wself;
+        if (!s || !s->_panel || !s->_panel.isVisible) return;
+        NSClipView *c = s->_scroll.contentView;
+        CGFloat max = fmax(0, s->_doc.frame.size.height - c.bounds.size.height);   // the new document's reachable top
+        [c setBoundsOrigin:NSMakePoint(0, fmin(keepY, max))];
+    });
+}
+
+// Update the rows in place (a click, a timer tick, a menu toggle): each checkbox's state, enabled flag and title. The
+// "another version" labels cannot change without the list changing, and that rebuilds. Indexes line up because the
+// signature (count and names) is the same as what the rows were built from
+- (void)updateRows {
+    int n = dm_cheats_ncheats();
+    for (int i = 0; i < n && i < (int)_rows.count; i++) {
+        NSButton *b = _rows[i];
+        b.enabled = dm_cheat_kind_at(i) == 0;
+        b.state = cheat_row_state(i);
+        NSString *full = cheat_row_title(i);
+        if (![b.title isEqualToString:full]) { b.title = full; b.toolTip = full; }
+    }
+}
+
+// The one refresh: the header and the folder button always, the rows rebuilt when the list of cheats changed (a reload),
+// only updated when it did not. Nothing happens while the panel is not on screen — it fills itself in show
+- (void)refresh {
+    if (!_panel || !_panel.isVisible) return;
+    [self fillHeader];
+    [self updateSelectButtons];
+    _openFolder.enabled = ({ const char *d = dm_cheats_dir_path(); d && *d; });
+    if (![_rows_sig isEqualToString:[self rowsSig]]) [self rebuildRows];   // the list changed: rebuild (also the first fill)
+    else [self updateRows];
+}
+
+// Arm the ~1 s refresh unless it is already running: called by show and by the app's return to the foreground (the utility
+// panel hides with the app and comes back by itself, so its timer has to come back too)
+- (void)startTimer {
+    if (_refreshTimer.isValid) return;
+    _refreshTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+}
+
+// One timer tick: refresh the rows, and stop for a panel that is no longer on screen (a close stops the timer itself; this
+// covers the hide that comes with the app's deactivation): a panel nobody can see costs no wake-ups after this one
+- (void)tick {
+    if (!_panel.isVisible) { [_refreshTimer invalidate]; _refreshTimer = nil; return; }
+    [self refresh];
+}
+
+// The app was deactivated: the utility panel goes off screen with it (hidesOnDeactivate, its default), so the refresh
+// timer has nobody to serve until the app comes back. Whether the panel was up decides whether it comes back with a timer
+- (void)appResignedActive:(NSNotification *)n {
+    (void)n;
+    _upOnDeactivate = _panel.isVisible;
+    [_refreshTimer invalidate];
+    _refreshTimer = nil;
+}
+
+// The app is active again: AppKit brings back a panel that was up on its own, possibly after this notification, so the
+// timer is armed a main-queue turn later when the panel was up (its first tick stops it again if the panel did not come
+// back). A panel the player had closed is left without one
+- (void)appBecameActive:(NSNotification *)n {
+    (void)n;
+    dispatch_async(dispatch_get_main_queue(), ^{ if (_upOnDeactivate) [self startTimer]; });
+}
+
+// Shown: order the panel front (created first if needed) — orderFront, not makeKeyAndOrderFront, so the
+// game window stays key (its keyboard and controllers keep working, no focus-lost reaches the game). While the panel is on
+// screen a ~1 s timer refreshes it, so a cheat the VM turned off at run time shows its reason without a click
+- (void)show {
+    if (!_panel) [self makePanel];
+    [_panel orderFront:self];
+    [self refresh];   // after the panel is on screen: the guard in refresh checks visibility
+    [self startTimer];
+}
+
+// The close button: hide instead of close (the panel object and its autosaved frame stay for the process's lifetime), and
+// take the refresh timer down with the panel
+- (BOOL)windowShouldClose:(NSWindow *)w {
+    if (w != _panel) return YES;
+    [_refreshTimer invalidate];
+    _refreshTimer = nil;
+    [_panel orderOut:nil];
+    return NO;
+}
+@end
 
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
@@ -341,6 +714,10 @@ void front_run(void (*guest)(void)) {
         NSMenu *cm = [[NSMenu alloc] initWithTitle:@"Cheats"];
         cm.delegate = g_cheats_menu;
         cm.autoenablesItems = NO;   // the delegate sets enabled on every row itself
+        // Fill the rows now: AppKit matches a key equivalent (⌘R, ⌘⇧C) only against items that exist, and it calls the
+        // delegate's menuNeedsUpdate: when the menu is opened, not at launch, so without this neither works until the
+        // Cheats menu has been opened once. Every open rebuilds them through the delegate as before
+        [g_cheats_menu menuNeedsUpdate:cm];
         [[bar addItemWithTitle:@"Cheats" action:nil keyEquivalent:@""] setSubmenu:cm];
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
