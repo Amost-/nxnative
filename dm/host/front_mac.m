@@ -19,6 +19,7 @@
 #include "motion_pro_mac.h"
 #include <signal.h>
 #include <math.h>
+#include <sys/stat.h>
 
 static CAMetalLayer *g_layer;
 static uint64_t g_btn;
@@ -245,6 +246,57 @@ static void *guest_tramp(void *p) {
 
 // Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
 __attribute__((constructor)) static void hud_env(void) { front_hud_env(); }
+
+// The Cheats menu of the game window (hle_cheats.c's rows, only meaningful with a window): rebuilt on every open, so the
+// loaded file's state, the menu's toggles and the cheats the VM disabled at run time are what the player sees. Rows: one
+// per cheat (a plain row carries its checkmark and toggles on click; a master code is always on and not clickable; a
+// disabled row shows its reason, "(unsupported opcode N)" or the run-time "(off: ...)"), the disabled rows the brief
+// names when no file of this build is loaded — "No cheats for build ..." plus each other build's .txt in the folder —
+// and the two commands at the bottom, still usable when no file matches yet, so a file dropped in while playing needs
+// no re-launch. All rows come from the C API; this file holds no cheats state
+@interface DmCheatsMenuDelegate : NSObject <NSMenuDelegate>
+@end
+@implementation DmCheatsMenuDelegate
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    [menu removeAllItems];
+    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
+        const char *nm = dm_cheat_name_at(i), *why = dm_cheat_why_at(i);
+        NSMenuItem *it = [menu addItemWithTitle:why && *why ? [NSString stringWithFormat:@"%s%s", nm, why] : [NSString stringWithUTF8String:nm] action:nil keyEquivalent:@""];
+        int kind = dm_cheat_kind_at(i);
+        if (kind == 0) { it.target = self; it.action = @selector(toggleCheat:); it.tag = i; }
+        else if (kind == 1) it.title = [NSString stringWithFormat:@"%s — master code (always on)", nm];
+        it.enabled = kind == 0;
+        it.state = dm_cheat_on_at(i) ? NSControlStateValueOn : NSControlStateValueOff;
+    }
+    for (int i = 0, n = dm_cheats_nothers(); i < n; i++) {   // .txt files of other builds, lightly disabled (the brief's wording)
+        NSMenuItem *it = [menu addItemWithTitle:[NSString stringWithFormat:@"Cheats for build %s (another version of the game)", dm_cheats_other(i)] action:nil keyEquivalent:@""];
+        it.enabled = NO;
+    }
+    if (!dm_cheats_found()) {
+        NSMenuItem *it = [menu addItemWithTitle:[NSString stringWithFormat:@"No cheats for build %@", [NSString stringWithUTF8String:dm_cheats_build()]] action:nil keyEquivalent:@""];
+        it.enabled = NO;
+    }
+    [menu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *re = [menu addItemWithTitle:@"Reload cheats" action:@selector(reloadCheats:) keyEquivalent:@"r"];
+    re.target = self;
+    const char *dir = dm_cheats_dir_path();
+    NSMenuItem *op = [menu addItemWithTitle:@"Open cheats folder" action:dir && *dir ? @selector(openCheatsFolder:) : nil keyEquivalent:@""];
+    op.target = self;
+    op.enabled = dir && *dir != 0;
+}
+- (void)toggleCheat:(NSMenuItem *)it {
+    dm_cheat_toggle((int)it.tag);
+    it.state = dm_cheat_on_at((int)it.tag) ? NSControlStateValueOn : NSControlStateValueOff;   // The new state right now; a run-time [RED] kill shows its reason when the menu next opens
+}
+- (void)reloadCheats:(NSMenuItem *)it { (void)it; dm_cheats_reload(); }
+- (void)openCheatsFolder:(NSMenuItem *)it {   // The brief: the action creates the folder when it is missing, then reveals it
+    (void)it;
+    const char *dir = dm_cheats_dir_path();
+    if (dir && *dir) { mkdir(dir, 0755); [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:@(dir)]]; }
+}
+@end
+static DmCheatsMenuDelegate *g_cheats_menu;   // NSMenu keeps its delegate unretained
+
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -284,6 +336,12 @@ void front_run(void (*guest)(void)) {
         NSMenu *bar = [NSMenu new], *app = [NSMenu new], *wm = [[NSMenu alloc] initWithTitle:@"Window"];
         [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:app];
         [app addItemWithTitle:@"Quit " DM_GAME_NAME action:@selector(terminate:) keyEquivalent:@"q"];
+        // Cheats (hle_cheats.c): the rows rebuild on every open through the delegate, the same rows the file reload changes
+        g_cheats_menu = [DmCheatsMenuDelegate new];
+        NSMenu *cm = [[NSMenu alloc] initWithTitle:@"Cheats"];
+        cm.delegate = g_cheats_menu;
+        cm.autoenablesItems = NO;   // the delegate sets enabled on every row itself
+        [[bar addItemWithTitle:@"Cheats" action:nil keyEquivalent:@""] setSubmenu:cm];
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         NSApp.mainMenu = bar;

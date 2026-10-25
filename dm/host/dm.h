@@ -135,6 +135,25 @@ void dm_guest_write_prep_register(void (*fn)(void *addr, size_t len));
 void dm_res_report_register(void (*fn)(uint32_t tick, const char *why));   // Resource count callback (registered by the graphics layer): called every 250 ticks, when the loading screen has been dismissed, and on exit when the record is full
 void (*dm_res_report_cb(void))(uint32_t tick, const char *why);   // Get the registered resource count callback (null if not registered)
 void dm_guest_write_prepare(void *addr, size_t len);
+void dm_guest_heap_range(uint64_t *base, size_t *open_len);   // hle_svc.c: the guest heap's base and opened length (guest addresses), 0 / 0 when none
+int dm_guest_heap_read(uint64_t addr, void *out, size_t len);    // hle_svc.c: hole-free guest heap read for the cheat VM (under the memory lock); 0 = ok, 1 = a byte outside the opened span
+int dm_guest_heap_write(uint64_t addr, const void *src, size_t len);   // hle_svc.c: hole-free guest heap write (the dirty tracking sees it first)
+// Cheats (hle_cheats.c): Atmosphère-format cheat code files applied to the running game (docs/development.md "Cheats")
+void dm_cheats_init(void);            // Called once in host_preload after loading the modules (main.c): reads DM_CHEATS and friends, loads the build's file
+void dm_cheats_present(void);         // Per presented frame (hle_nvn.c presents): applies the enabled cheats once
+// The Cheats submenu's rows (front_mac.m, Mac window only). Readers of the list of cheats; the front end copies the strings out immediately
+int dm_cheats_found(void);            // A cheat file is loaded (this build's, or another build's on DM_CHEATS_ANY_BUILD)
+int dm_cheats_ncheats(void);          // The loaded file's cheats, in file order
+const char *dm_cheats_build(void);    // This game's build ID, first 16 hex digits ("" when the main NSO has none)
+const char *dm_cheats_dir_path(void); // The cheats folder ("", when neither DM_CHEATS nor DM_ROOT is set: the menu's folder action is off)
+int dm_cheats_nothers(void);          // The .txt files of other builds in the folder (the menu's disabled "another version" rows)
+const char *dm_cheats_other(int i);
+const char *dm_cheat_name_at(int i);
+const char *dm_cheat_why_at(int i);   // The disabled state's reason (" (unsupported opcode N)", " (off: ...)"); "" when plain
+int dm_cheat_kind_at(int i);          // 0 a plain row (click toggles), 1 master (always on, no toggle), 2 disabled (broken or killed at run time)
+int dm_cheat_on_at(int i);
+void dm_cheat_toggle(int i);          // The click on a plain row: flips the cheat and rewrites <build ID>.enabled
+void dm_cheats_reload(void);          // "Reload cheats": re-reads the file (the same path), so edits during play need no re-launch
 // Graphics lifecycle (hle_nvn.c): on=1 suspends (afterwards submit / present block, and in-flight GPU work is drained before returning), on=0 resumes; called by the iOS front end when entering and leaving the background
 void dm_gfx_suspend(int on);
 void dm_gfx_enter(void); void dm_gfx_leave(void);   // hle_nvn.c: the gate dm_gfx_suspend closes, for graphics layers other than NVN (dm/gfx/vk)
