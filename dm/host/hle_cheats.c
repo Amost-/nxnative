@@ -13,12 +13,16 @@
 // that set them, are reset per cheat: a loop end without its start jumps to the first word of its own cheat, not of the
 // whole program and never into another cheat's words. Implemented opcodes: 0 store static, 1 begin
 // conditional, 2 end / else, 3 loop, 4 load register static, 5 load register from memory, 6 store static to a register
-// address, 7 legacy arithmetic, 8 key-press conditional, A store register to memory, C0 register conditional, C3 static
-// registers (read 0x00..0x7F into a register, write a register to 0x80..0xFF; kept across passes, cleared when the file is
-// loaded; on a Switch an overlay tool fills the readable ones and reads the written ones, and nothing here does yet, so a
-// cheat reads 0). A cheat that uses anything else (register arithmetic 9, save / restore C1 / C2, the extended key-press C4,
-// pause / resume, the debug log, or an unknown form) is turned off before it ever runs, shown in the menu with
-// "(unsupported opcode N)". The reference's memory-type nybble selects 0 main NSO, 1 heap, 2 alias, 3 aslr, 4 absolute
+// address, 7 legacy arithmetic, 8 key-press conditional, 9 register arithmetic (integer and float), A store register to
+// memory, C0 register conditional, C1 / C2 save and restore of registers (the saved values reset once per pass like the
+// registers), C3 static registers (read 0x00..0x7F into a register, write a register to 0x80..0xFF; kept across passes,
+// cleared when the file is loaded; on a Switch an overlay tool fills the readable ones and reads the written ones, and
+// nothing here does yet, so a cheat reads 0), C4 extended key-press conditional (a 64-bit mask; without auto-repeat it is
+// met only on the pass where the keys became held, against one previous-keys value shared by every C4 of the pass, as
+// the reference's static is). The keys are read once per pass, before the first cheat, as the reference's Execute does.
+// A cheat that uses anything else (pause / resume, the debug log, or an unknown form) is turned off before it ever runs,
+// shown in the menu with "(unsupported opcode N)".
+// The reference's memory-type nybble selects 0 main NSO, 1 heap, 2 alias, 3 aslr, 4 absolute
 // and 5..F main, from the host's own layout. What an access reaches follows the kernel's debug rule as the reference has
 // it: a read any page the guest address block or a module maps, a write main (through its writable alias), the opened heap,
 // another module's data and any other mapped guest page, never another module's code nor the host's key page. A failed
@@ -270,7 +274,7 @@ static int op_cond_begin(unsigned op) { return op == 1 || op == 8 || op == 0xC0 
 // failure there is described, not recorded), so the reason lives here rather than only in c->why
 static char g_dec_why[48];
 
-// Unsupported opcode, with the reference's own opcode name in the menu label ("unsupported opcode 9", "… FF0")
+// Unsupported opcode, with the reference's own opcode name in the menu label ("unsupported opcode FFF", "… FF0")
 static int ins_unsupported(cheat_t *c, const uint32_t *p) {
     snprintf(g_dec_why, sizeof g_dec_why, "unsupported opcode %X", op_kind(p[0]));
     if (!g_dry) { snprintf(c->why, sizeof c->why, " (%s)", g_dec_why); c->broken = 1; }
@@ -291,9 +295,12 @@ typedef struct {
 // The width nibble every sized form shares: 1, 2, 4 or 8 bytes
 static int width_ok(unsigned t) { return t == 1 || t == 2 || t == 4 || t == 8; }
 
+// The width's mask for conditions, arithmetic results and immediates (the reference truncates to the width)
+static uint64_t width_mask(unsigned t) { return t == 8 ? UINT64_MAX : (1ull << (8 * t)) - 1; }
+
 // Decode the instruction at p (n words left) or 0 when it cannot run here (c->why: why). Mirrors the reference
 // DecodeNextOpcode field by field, so the run never miscounts a word; outside what the host implements
-// (opcodes 0..8, A, C0, C3 with the reference's value widths and its six comparisons) the verdict is unsupported. The
+// (opcodes 0..A, C0..C4 with the reference's value widths and its six comparisons) the verdict is unsupported. The
 // memory-type nybble is never a verdict: every value selects a base (region_base), as the reference's
 // GetCheatProcessAddress has a base for each (5..F share main's)
 static int ins_dec(cheat_t *c, const uint32_t *p, int n, ins_t *o) {
@@ -377,6 +384,17 @@ static int ins_dec(cheat_t *c, const uint32_t *p, int n, ins_t *o) {
                     // on 24..27 can never be held here, no input source of this host reports them, so such a mask is never met
             o->val = w & 0x0FFFFFFFu;
             break;
+        case 9: {   // 9TCRSIs0 (VVVVVVVV (VVVVVVVV)): reg[r] = reg[s] op operand, the operand reg[x] or, for I != 0, an
+                    // immediate of T bytes (the low T bytes of one word; two words, high first, for T = 8); C the math
+                    // type (0..9 integer, 10..13 float); the result is truncated to T bytes at run time
+            if ((t = (w >> 24) & 0xF, !width_ok(t))) UNSUP(c, "width");
+            o->t = t; o->c = (w >> 20) & 0xF; o->r = (w >> 16) & 0xF; o->s = (w >> 12) & 0xF;
+            o->flags = ((w >> 8) & 0xF) != 0; o->x = (w >> 4) & 0xF;
+            if (o->flags) {
+                if (n < (t == 8 ? 3 : 2)) UNSUP(c, "truncated");
+                o->val = t == 8 ? ((uint64_t)p[1] << 32) | p[2] : p[1] & width_mask(t); o->len = t == 8 ? 3 : 2;
+            }
+        } break;
         case 0xA: { // ATSRIOxa (aaaaaaaa): store reg[s] (width T) at an address from reg[r] and the offset type O:
                     // 0 reg[r], 1 reg[r] + reg[x], 2 reg[r] + a, 3 region x + reg[r], 4 region x + a, 5 region x + reg[r] + a;
                     // I (flags) adds the width to reg[r] afterwards
@@ -418,10 +436,23 @@ static int ins_dec(cheat_t *c, const uint32_t *p, int n, ins_t *o) {
                 default: UNSUP(c, "operand");
             }
         } break;
+        case 0xC1:  // C10D0Sx0: the operation x (c) between reg[d] (r) and saved[s]: 0 reg[d] = saved[s], 1 saved[d] = reg[s],
+                    // 2 saved[d] = 0, 3 reg[d] = 0 (any other x restores, the reference's default)
+            o->r = (w >> 16) & 0xF; o->s = (w >> 8) & 0xF; o->c = (w >> 4) & 0xF;
+            break;
+        case 0xC2:  // C2x0XXXX: the C1 operation x (c) on every register i whose bit of the 16-bit mask (val) is set, reg[i] <-> saved[i]
+            o->c = (w >> 20) & 0xF; o->val = w & 0xFFFF;
+            break;
+        case 0xC4: {   // C4r00000 kkkkkkkk kkkkkkkk: a 64-bit key mask (high word first). r != 0 (flags): auto-repeat, met
+                       // while every key is held like 8; r = 0: met only on the pass where the mask became fully held
+            if (n < 3) UNSUP(c, "truncated");
+            o->flags = ((w >> 20) & 0xF) != 0;
+            o->val = ((uint64_t)p[1] << 32) | p[2]; o->len = 3;
+        } break;
         case 0xC3:  // C3000XXx: static register XX: 0x00..0x7F read into reg[x], 0x80..0xFF written from reg[x]
             o->x = (w >> 4) & 0xFF; o->r = w & 0xF;
             break;
-        default:    // 9, B, C1, C2, C4, F... and any unknown form
+        default:    // B, C5..CF, F... (pause / resume, the debug log) and any unknown form
             return ins_unsupported(c, p);
     }
     if (o->len > (unsigned)n) UNSUP(c, "truncated");   // the cheat's words end in the middle of an instruction
@@ -630,7 +661,13 @@ static int cheat_read(cheat_t *c, uint64_t addr, uint64_t len, uint64_t *out) {
 
 // ---------- the cheat VM: one pass ----------
 
-static uint64_t g_reg[16];     // the reference's registers: reset once per pass, shared by its cheats (its saved values belong to C1/C2, not implemented)
+static uint64_t g_reg[16];     // the reference's registers: reset once per pass, shared by its cheats
+static uint64_t g_saved[16];   // the reference's saved values (C1 / C2): reset once per pass with the registers, shared the same way
+static uint64_t g_held;        // the keys held, read once at the start of the pass (the reference's one GetKeysHeld per
+                               // Execute): every key conditional (8, C4) of the pass sees the same keys. Written under g_lock only
+static uint64_t g_keyold;      // the keys held at the end of the last pass that ran a cheat (the reference's s_keyold, one
+                               // static for every C4): a C4 without auto-repeat is met only when its mask is held now and
+                               // was not fully held then. Never updated by a dry run. Under g_lock only
 static uint64_t g_looptop[16]; // the reference's loop tops, word indexes into the program that set them; each cheat is its own
                                // program here, so they are reset at the start of every cheat (vm_run): a loop end without
                                // its start jumps to word 0 of its own cheat, never to an index inside another cheat's words
@@ -703,8 +740,28 @@ static int vm_skip(cheat_t *c, const uint32_t *ins, int nins, int *pidx, int *pd
     return 0;
 }
 
-// The width's mask for conditions and arithmetic results (the reference truncates to the width)
-static uint64_t width_mask(unsigned t) { return t == 8 ? UINT64_MAX : (1ull << (8 * t)) - 1; }
+// The float operations of opcode 9 (c = 10 add, 11 sub, 12 mul, 13 div) on the bit patterns of the two operands, the
+// way the reference's bit_casts have them: T = 4 single precision on the low 32 bits of each operand, T = 8 double, any
+// other width 0. Plain IEEE arithmetic (the build has no fast-math): a NaN, an infinity (a division by 0 traps nowhere)
+// (the pass runs on the game's presenting thread, so a game that sets FPCR flush-to-zero or another rounding mode sees its own settings in these results, where dmnt in its own process would not: rare, and no game is known to)
+// or a denormal comes out bit for bit as the Switch's own FPU gives it
+static uint64_t float_math(unsigned c, unsigned t, uint64_t a, uint64_t b) {
+    if (t == 4) {
+        uint32_t ua = (uint32_t)a, ub = (uint32_t)b, ur; float x, y, r;
+        memcpy(&x, &ua, 4); memcpy(&y, &ub, 4);
+        r = c == 10 ? x + y : c == 11 ? x - y : c == 12 ? x * y : x / y;
+        memcpy(&ur, &r, 4);
+        return ur;
+    }
+    if (t == 8) {
+        uint64_t ur; double x, y, r;
+        memcpy(&x, &a, 8); memcpy(&y, &b, 8);
+        r = c == 10 ? x + y : c == 11 ? x - y : c == 12 ? x * y : x / y;
+        memcpy(&ur, &r, 8);
+        return ur;
+    }
+    return 0;
+}
 
 // The six comparisons in the reference's number order (opcodes 1 and C0, both unsigned): 1 >, 2 >=, 3 <, 4 <=, 5 ==, 6 !=
 static int cond_met(unsigned cond, uint64_t got, uint64_t want) {
@@ -729,11 +786,18 @@ static int vm_run(cheat_t *c) {
                 if (!region_ready(c, in.m)) return -1;
                 cheat_write(c, region_base(in.m) + in.rel + g_reg[in.r], in.t, in.val & width_mask(in.t));
             } break;
-            case 8: case 1: {   // key-press conditional (8) / memory conditional (1): depth counted like the reference, before the verdict
+            case 8: case 0xC4: case 1: {   // key-press conditionals (8, C4) / memory conditional (1): depth counted like the reference, before the verdict
                 depth++;
                 int met = 1;
                 if (in.op == 8) {
-                    met = (dm_cheats_keys() & in.val) == in.val;   // every key of the mask held
+                    met = (g_held & in.val) == in.val;   // every key of the mask held (the keys of this pass)
+                } else if (in.op == 0xC4) {
+                    // Every key of the 64-bit mask held now; without auto-repeat, only if the mask was not fully held at
+                    // the end of the last pass (the reference's one s_keyold, which no C4 of the pass changes: two C4s
+                    // of the same mask both fire on that pass). An empty mask without auto-repeat is never met: the old
+                    // keys always hold all of nothing, as they do in the reference
+                    int now = (g_held & in.val) == in.val;
+                    met = in.flags ? now : now && (g_keyold & in.val) != in.val;
                 } else {
                     if (!region_ready(c, in.m)) return -1;   // the conditional reads the region it names
                     // The reference reads into a zeroed value and compares whatever is there afterwards: a failed read
@@ -808,6 +872,43 @@ static int vm_run(cheat_t *c) {
                 }
                 g_reg[in.r] = r & width_mask(in.t);
             } break;
+            case 9: {   // register arithmetic: reg[r] = reg[s] op (reg[x] or the immediate), the full 64-bit operands into the
+                        // operation (the immediate already cut to T bytes, zero-extended, as the reference's GetVmInt gives
+                        // it) and only the result truncated to the width; an unknown math type stores 0 (the reference's
+                        // res_val stays 0). The shift counts are masked to 63 bits: the reference's C++ shift of a 64-bit
+                        // value is undefined past 63, and the Switch's own core, where it compiles to LSLV / LSRV, takes
+                        // the count modulo 64, as opcode 7 does here
+                uint64_t a = g_reg[in.s], b = in.flags ? in.val : g_reg[in.x], r;
+                switch (in.c) {
+                    case 0: r = a + b; break;           // 0 add
+                    case 1: r = a - b; break;           // 1 sub
+                    case 2: r = a * b; break;           // 2 mul
+                    case 3: r = a << (b & 63); break;   // 3 lsl
+                    case 4: r = a >> (b & 63); break;   // 4 lsr
+                    case 5: r = a & b; break;           // 5 and
+                    case 6: r = a | b; break;           // 6 or
+                    case 7: r = ~a; break;              // 7 not (the operand is ignored)
+                    case 8: r = a ^ b; break;           // 8 xor
+                    case 9: r = a; break;               // 9 move
+                    case 10: case 11: case 12: case 13: r = float_math(in.c, in.t, a, b); break;   // float add / sub / mul / div
+                    default: r = 0; break;              // 14, 15: no operation defined, the reference stores 0
+                }
+                g_reg[in.r] = r & width_mask(in.t);
+            } break;
+            case 0xC1:   // save / restore one register: 0 restore reg[r] from saved[s], 1 save reg[s] into saved[r], 2 clear saved[r], 3 clear reg[r]
+                switch (in.c) {
+                    case 1: g_saved[in.r] = g_reg[in.s]; break;
+                    case 2: g_saved[in.r] = 0; break;
+                    case 3: g_reg[in.r] = 0; break;
+                    default: g_reg[in.r] = g_saved[in.s]; break;   // 0, and the reference's default for any other x
+                }
+                break;
+            case 0xC2:   // the same operation on every register of the 16-bit mask, each with its own saved slot
+                for (unsigned i = 0; i < 16; i++) {
+                    if (!(in.val & (1u << i))) continue;
+                    if (in.c == 1) g_saved[i] = g_reg[i]; else if (in.c == 2) g_saved[i] = 0; else if (in.c == 3) g_reg[i] = 0; else g_reg[i] = g_saved[i];
+                }
+                break;
             case 0xA: {   // store register: reg[s] (width) at the address of the offset type, reg[r] += width for I=1
                 uint64_t addr;
                 switch (in.o) {
@@ -879,28 +980,32 @@ static void note_settle(cheat_t *c) {
 }
 
 // One pass: the masters first, then the enabled cheats in file order, as the reference's LoadProgram orders them. The
-// registers are reset once per pass, before the first cheat, and shared by every cheat of the pass: the reference's
-// ResetState over its one concatenated program (docs/reference/cheats.md, "One program per pass"), which
-// cheat_anchor.py's pointer chains rely on when they zero register 15 behind themselves. Each cheat is still its own
-// program (vm_run): the conditional depth starts at 0 and the loop tops are reset for each (they index the cheat's own
-// words), so an unclosed block cannot swallow the next cheat and a stray loop end stays inside its own cheat. The
-// static registers stay. The lock is never waited for: a pass that arrives while a menu operation or another pass runs is
-// simply skipped (the next frame / tick applies again). The master switch stops everything; safe mode holds the masters
-// back too; a "set" cheat turns itself off after its pass
+// keys are read once, then the registers and the saved values are reset, before the first cheat, and shared by every
+// cheat of the pass: the reference's Execute (one GetKeysHeld, then ResetState) over its one concatenated program
+// (docs/reference/cheats.md, "One program per pass"), which cheat_anchor.py's pointer chains rely on when they zero
+// register 15 behind themselves. Each cheat is still its own program (vm_run): the conditional depth starts at 0 and the
+// loop tops are reset for each (they index the cheat's own words), so an unclosed block cannot swallow the next cheat
+// and a stray loop end stays inside its own cheat. The static registers stay, and so does the previous-keys value of C4,
+// which the end of a pass that ran a VM cheat sets to this pass's keys (the reference's s_keyold, written at the end of
+// Execute, which only runs when the program has words). The lock is never waited for: a pass that arrives while a menu
+// operation or another pass runs is simply skipped (the next frame / tick applies again). The master switch stops
+// everything; safe mode holds the masters back too; a "set" cheat turns itself off after its pass
 static void cheats_pass(void) {
     if (!atomic_load(&g_active) || !atomic_load(&g_master)) return;
     if (pthread_mutex_trylock(&g_lock)) return;
     if (!atomic_load(&g_master)) { pthread_mutex_unlock(&g_lock); return; }   // switched off while this pass waited for the lock
-    int fired = 0;
-    memset(g_reg, 0, sizeof g_reg);   // the reference's once-per-pass ResetState (the loop tops: per cheat, in vm_run)
+    int fired = 0, ran = 0;
+    g_held = dm_cheats_keys();
+    memset(g_reg, 0, sizeof g_reg); memset(g_saved, 0, sizeof g_saved);   // the reference's once-per-pass ResetState (the loop tops: per cheat, in vm_run)
     for (int half = 0; half < 2; half++) for (int i = 0; i < g_ncheat; i++) {
         cheat_t *c = &g_cheat[i];
         if (!pass_runs(c, half)) continue;
         c->pass_fail = 0;
-        if (c->nd) nd_step(c); else vm_run(c);
+        if (c->nd) nd_step(c); else { vm_run(c); ran = 1; }
         note_settle(c);
         if ((c->once || c->restore_once) && half) { c->on = 0; c->restore_once = 0; fired = 1; }
     }
+    if (ran) g_keyold = g_held;
     if (fired) states_save();   // the file writes themselves leave on the files queue: the presenting thread never waits for the disk
     pthread_mutex_unlock(&g_lock);
 }
@@ -1414,7 +1519,7 @@ static void meta_version(const char *meta_path, const char *bid, char *out, size
     fclose(f);
 }
 
-// Is program word k of a cheat a value field of its instruction (the value of 0 / 1 / 4 / 6 / 7, C0's static value)?
+// Is program word k of a cheat a value field of its instruction (the value of 0 / 1 / 4 / 6 / 7, 9's immediate, C0's static value)?
 // Decodes with a scratch cheat, so the cheat itself is never touched
 static int value_word(const cheat_t *c, int k) {
     static cheat_t probe;   // the decoder's scratch (it writes why / broken on a failure); callers hold g_lock
@@ -1422,7 +1527,7 @@ static int value_word(const cheat_t *c, int k) {
         ins_t in;
         int len = ins_dec(&probe, c->ins + a, c->nins - a, &in);
         if (len <= 0) return 0;
-        int first = in.op == 0 || in.op == 1 ? a + 2 : in.op == 4 || in.op == 6 || in.op == 7 ? a + 1 : in.op == 0xC0 && in.o == 4 ? a + 1 : -1;
+        int first = in.op == 0 || in.op == 1 ? a + 2 : in.op == 4 || in.op == 6 || in.op == 7 ? a + 1 : (in.op == 0xC0 && in.o == 4) || (in.op == 9 && in.flags) ? a + 1 : -1;
         if (first >= 0 && k >= first && k < a + len) return 1;
         a += len;
     }
@@ -1828,10 +1933,11 @@ void dm_cheats_reload(void) {
 }
 
 // The dry run: what cheat i would write right now, one line per write ("main+0x… (2 bytes): 37 -> 999"), nothing written
-// and nothing turned off (static registers, never-decrease state and the failure counts are left as they were). The
-// cheats a pass runs before it (the masters, the enabled plain cheats earlier in the file) are replayed first with their
-// description switched off, so the registers hold what a real pass leaves in them when its turn comes (cheats_pass
-// shares them). Returns the number of writes
+// and nothing turned off (static registers, never-decrease state, the failure counts and C4's previous-keys value are
+// left as they were). The cheats a pass runs before it (the masters, the enabled plain cheats earlier in the file) are
+// replayed first with their description switched off, so the registers and the saved values hold what a real pass
+// leaves in them when its turn comes (cheats_pass shares them); the keys are read once, like a pass. Returns the number
+// of writes
 int dm_cheat_preview(int i, char *out, size_t cap) {
     if (!out || !cap) return 0;
     out[0] = 0;
@@ -1854,7 +1960,8 @@ int dm_cheat_preview(int i, char *out, size_t cap) {
     } else {
         static uint64_t keep[256];
         memcpy(keep, g_static, sizeof keep);
-        memset(g_reg, 0, sizeof g_reg);   // the loop tops are reset per cheat by vm_run
+        g_held = dm_cheats_keys();
+        memset(g_reg, 0, sizeof g_reg); memset(g_saved, 0, sizeof g_saved);   // the loop tops are reset per cheat by vm_run
         g_dry = 1;
         g_dry_out = NULL;   // the predecessors' run describes nothing (dry_line returns at once) and writes nothing
         for (int half = 0, stop = 0; half < 2 && !stop; half++) for (int j = 0; j < g_ncheat && !stop; j++) {

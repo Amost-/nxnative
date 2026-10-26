@@ -1,7 +1,9 @@
 // Cheat engine unit test (hle_cheats.c): the Atmosphère opcodes against hand-computed results held to
 // docs/reference/cheats.md (the memory and key conditionals, else, loops, the four load forms and the narrow load that
 // keeps a register's upper bytes, the register-address store, legacy arithmetic, nested skipping, the 8-byte word order,
-// a truncated instruction, A store register, C0 register conditional, C3 static registers), the pass (registers shared
+// a truncated instruction, 9 register arithmetic in every math type and width with the shifts and the float forms, A
+// store register, C0 register conditional, C1 / C2 save and restore across cheats and their reset between passes, C3
+// static registers, C4 extended key-press across passes with its one previous-keys value), the pass (registers shared
 // between the cheats of one pass, masters first, reset between passes), what an access may reach (main, the heap, another
 // module's data but not its code, a mapped page of the guest block but not an unmapped one) and that a failed access is
 // ignored and counted, never turning the cheat off; and the host's own layer over the format: labels and EdiZon
@@ -494,6 +496,93 @@ int main(void) {
     CHECK(strstr(pv3, "main+0x43E0 (4 bytes): 5 (0x5) -> 5 (0x5)") != NULL, "the dry run replays the cheats before it, so its registers are a real pass's");
     dm_cheat_toggle(at("P2", 0)); wr32(0x43E0, 7); cheats_pass();
     CHECK(rd32(0x43E0) == 0, "the registers are reset at the start of every pass");
+
+    // ---- opcode 9: every math type at every width, the immediate forms, the shifts, the float forms; the load verdict ----
+    fresh("math", "[Math]\n"
+          "40010000 00000000 FFFFFFFF\n" "94021100 00000002\n" "A8200400 00004600\n"     // r2 = (0xFFFFFFFF + 2) at width 4: 1
+          "40010000 00000000 00000005\n" "91131100 00000107\n" "A8300400 00004608\n"     // r3 = (5 - 7) at width 1: 0xFE; the width-1 immediate is the word's low byte
+          "92021100 00012345\n" "A8200400 00004698\n"                                    // r2 = 5 + 0x2345 at width 2 (the immediate's low 16 bits): 0x234A
+          "40040000 00000000 00001234\n" "40050000 00000000 00000010\n" "92264050\n" "A8600400 00004610\n"   // r6 = r4 * r5 at width 2: 0x12340 cut to 0x2340
+          "98371100 00000000 00000041\n" "A8700400 00004618\n"                           // r7 = 5 << 65: the count is masked to 63 bits (aarch64's LSLV), 10
+          "98381100 00000000 00000004\n" "A8800400 00004620\n"                           // r8 = 5 << 4 = 0x50
+          "94498100 00000004\n" "A8900400 00004628\n"                                    // r9 = r8 >> 4 = 5
+          "400A0000 00000000 000000F0\n" "400B0000 00000000 0000003C\n"
+          "915CA0B0\n" "A8C00400 00004630\n"                                             // rC = rA & rB = 0x30
+          "916DA0B0\n" "A8D00400 00004638\n"                                             // rD = rA | rB = 0xFC
+          "927EA000\n" "A8E00400 00004640\n"                                             // rE = ~rA at width 2 = 0xFF0F
+          "948FA0B0\n" "A8F00400 00004648\n"                                             // rF = rA ^ rB = 0xCC
+          "9891A000\n" "A8100400 00004650\n"                                             // r1 = rA (move) = 0xF0
+          "94E1A000\n" "A8100400 00004658\n"                                             // an unknown math type (14) stores 0
+          "40010000 80000000 00000000\n" "98411100 00000000 0000003F\n" "A8100400 00004690\n"   // the top bit >> 63 at width 8: 1
+          "[Float]\n"
+          "40010000 FFFFFFFF 3F800000\n" "94A21100 40000000\n" "A8200400 00004660\n"     // 1.0f (the register's upper half ignored) + 2.0f = 3.0f
+          "40030000 3FF00000 00000000\n" "98B43100 40080000 00000000\n" "A8400400 00004668\n"   // 1.0 - 3.0 = -2.0 (double)
+          "40050000 00000000 40400000\n" "94C65050\n" "A8600400 00004670\n"              // 3.0f * 3.0f (register operand) = 9.0f
+          "40070000 40100000 00000000\n" "98D83070\n" "A8800400 00004678\n"              // 1.0 / 4.0 (register operand) = 0.25
+          "40090000 00000000 00000001\n" "92A91100 00003C00\n" "A8900400 00004680\n"     // a float add at width 2 gives 0
+          "94DA5100 00000000\n" "A8A00400 00004688\n"                                    // 3.0f / 0.0f = +inf, no trap
+          "[T9]\n98011100 00000001\n"                                                    // an 8-byte immediate cut to one word
+          "[Log]\nFFF40400\n");                                                          // the debug log stays unsupported
+    load_all();
+    for (int i = 0; i < g_ncheat; i++) if (!dm_cheat_on_at(i) && dm_cheat_kind_at(i) == 0) dm_cheat_toggle(i);
+    cheats_pass();
+    CHECK(rd32(0x4600) == 1 && rd32(0x4604) == 0 && rd32(0x4608) == 0xFE && rd32(0x4698) == 0x234A, "9: add at width 4 and sub at width 1 truncate the result; a narrow immediate is the word's low bytes");
+    CHECK(rd32(0x4610) == 0x2340 && rd32(0x4614) == 0, "9: mul of two registers at width 2");
+    CHECK(rd32(0x4618) == 10 && rd32(0x461C) == 0 && rd32(0x4620) == 0x50 && rd32(0x4628) == 5, "9: shl by 65 shifts by 1 (the count masked as the Switch's core does), shl by 4, shr by 4");
+    CHECK(rd32(0x4690) == 1 && rd32(0x4694) == 0, "9: shr by 63 of a full 64-bit register");
+    CHECK(rd32(0x4630) == 0x30 && rd32(0x4638) == 0xFC && rd32(0x4640) == 0xFF0F && rd32(0x4648) == 0xCC, "9: and, or, not (at width 2), xor");
+    CHECK(rd32(0x4650) == 0xF0 && rd32(0x4658) == 0, "9: move; an unknown math type stores 0");
+    CHECK(rd32(0x4660) == 0x40400000 && rd32(0x4664) == 0, "9: float add at width 4 on the register's low 32 bits");
+    CHECK(rd32(0x4668) == 0 && rd32(0x466C) == 0xC0000000, "9: float sub at width 8 (-2.0)");
+    CHECK(rd32(0x4670) == 0x41100000 && rd32(0x4678) == 0 && rd32(0x467C) == 0x3FD00000, "9: float mul (9.0f) and div (0.25) with register operands");
+    CHECK(rd32(0x4680) == 0 && rd32(0x4684) == 0 && rd32(0x4688) == 0x7F800000, "9: a float operation at width 2 gives 0; a division by zero gives an infinity");
+    CHECK(dm_cheat_kind_at(at("T9", 0)) == 2 && strstr(dm_cheat_why_at(at("T9", 0)), "truncated"), "9: an immediate cut short marks the cheat at load");
+    CHECK(dm_cheat_kind_at(at("Log", 0)) == 2 && strstr(dm_cheat_why_at(at("Log", 0)), "unsupported opcode FFF"), "the debug log is still an unsupported opcode");
+    CHECK(value_word(&g_cheat[at("Math", 0)], 4) && !value_word(&g_cheat[at("Math", 0)], 3), "9: its immediate word is a value word the panel may set, its opcode word is not");
+
+    // ---- C1 / C2: save and restore across the cheats of a pass, every operation; the saved values reset between passes ----
+    fresh("save", "[Save]\n"
+          "40010000 00000000 00000005\n" "40020000 00000000 00000006\n"   // r1 = 5, r2 = 6
+          "C1030110\n"                                                     // saved[3] = r1
+          "C2100004\n"                                                     // mask save: saved[2] = r2
+          "[Restore]\n"
+          "C1040300\n" "A8400400 00004700\n"                               // r4 = saved[3]: 5, from the cheat before
+          "C1020030\n" "A8200400 00004708\n"                               // clear r2: 0
+          "C2000004\n" "A8200400 00004710\n"                               // mask restore: r2 = saved[2]: 6
+          "40050000 00000000 00000007\n" "C1030020\n" "C1050300\n" "A8500400 00004718\n"   // clear saved[3]; r5 = saved[3]: 0
+          "40060000 00000000 00000009\n" "C2200004\n" "C1060200\n" "A8600400 00004720\n"   // mask clear saved[2]; r6 = saved[2]: 0
+          "C2300010\n" "A8400400 00004728\n"                               // mask clear r4: 0
+          "C1030110\n" "C1070390\n" "A8700400 00004730\n");                // saved[3] = r1 again; an unknown x (9) restores: r7 = 5
+    load_all(); dm_cheat_toggle(at("Save", 0)); dm_cheat_toggle(at("Restore", 0)); cheats_pass();
+    CHECK(rd32(0x4700) == 5 && rd32(0x4704) == 0 && rd32(0x4710) == 6, "C1 / C2: a value saved by one cheat is restored by a later one of the same pass");
+    CHECK(rd32(0x4708) == 0 && rd32(0x4718) == 0 && rd32(0x4720) == 0 && rd32(0x4728) == 0, "C1 / C2: clear register, clear saved value, by index and by mask");
+    CHECK(rd32(0x4730) == 5, "C1: an unknown operation restores");
+    dm_cheat_toggle(at("Save", 0)); cheats_pass();
+    CHECK(rd32(0x4700) == 0 && rd32(0x4710) == 0, "the saved values are reset at the start of every pass, like the registers");
+
+    // ---- C4 across passes: the edge form fires on the pass where the keys became held, against one previous-keys value shared by every C4 ----
+    fresh("c4", "[Edge]\n"  "C4000000 00000000 00000001\n" "54010000 00004740\n" "78010000 00000001\n" "A4100400 00004740\n" "20000000\n"   // r = 0, A: the counter at 0x4740 + 1
+          "[Edge2]\n" "C4000000 00000000 00000001\n" "54010000 00004760\n" "78010000 00000001\n" "A4100400 00004760\n" "20000000\n"   // the same mask again
+          "[Repeat]\n" "C4100000 00000000 00000001\n" "54010000 00004748\n" "78010000 00000001\n" "A4100400 00004748\n" "20000000\n"  // r = 1: while held
+          "[High]\n" "C4100000 00000001 00000000\n" "04000000 00004750 00000001\n" "20000000\n"      // bit 32 of the 64-bit mask: no input source reports it
+          "[Empty0]\n" "C4000000 00000000 00000000\n" "04000000 00004758 00000001\n" "20000000\n");  // an empty mask without auto-repeat: never an edge
+    load_all();
+    for (int i = 0; i < g_ncheat; i++) if (!dm_cheat_on_at(i) && dm_cheat_kind_at(i) == 0) dm_cheat_toggle(i);
+    held = DM_BTN_A; cheats_pass();
+    CHECK(rd32(0x4740) == 1 && rd32(0x4760) == 1 && rd32(0x4748) == 1, "C4: A pressed: the edge form and the auto-repeat form both fire; two edge C4s of one mask both see the edge");
+    cheats_pass();
+    CHECK(rd32(0x4740) == 1 && rd32(0x4760) == 1 && rd32(0x4748) == 2, "C4: A still held: only the auto-repeat form fires again");
+    held = 0; cheats_pass();
+    CHECK(rd32(0x4740) == 1 && rd32(0x4748) == 2, "C4: released: nothing fires");
+    held = DM_BTN_A | DM_BTN_B; cheats_pass();
+    CHECK(rd32(0x4740) == 2 && rd32(0x4760) == 2 && rd32(0x4748) == 3, "C4: pressed again, with another key too: a new edge");
+    CHECK(rd32(0x4750) == 0 && rd32(0x4758) == 0, "C4: a mask above bit 23 is never held; an empty mask is never an edge");
+    held = 0; cheats_pass(); held = DM_BTN_A;
+    char pv4[512]; int nw4 = dm_cheat_preview(at("Edge", 0), pv4, sizeof pv4);
+    CHECK(nw4 == 1 && strstr(pv4, "main+0x4740 (4 bytes): 2 (0x2) -> 3 (0x3)"), "C4: the dry run sees the edge");
+    cheats_pass();
+    CHECK(rd32(0x4740) == 3, "C4: the dry run did not consume it: the next pass fires");
+    held = 0;
 
     // ---- DM_CHEATS_ANY_BUILD counts only files named after a build ID; the running flag follows a reload that finds no file ----
     fresh("any", NULL); put("readme.txt", "hello\n");
