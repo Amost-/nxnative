@@ -1091,7 +1091,10 @@ static void parse_file(const char *path) {
             memset(cur, 0, sizeof *cur);
             cur->pair = -1;
             // the name keeps NAME_MAX - 1 characters: a shorter cut once let two long-named cheats share a line in <build>.enabled
-            snprintf(cur->name, NAME_MAX, "%.*s", (int)(nl > 127 ? 127 : nl), p + 1);
+            // a cut name ends on a UTF-8 character boundary: the first byte left out must not be a continuation byte
+            int keep = (int)(nl > 127 ? 127 : nl);
+            if (nl > 127) while (keep > 0 && ((unsigned char)p[1 + keep] & 0xC0) == 0x80) keep--;
+            snprintf(cur->name, NAME_MAX, "%.*s", keep, p + 1);
             cur->master = end == '}';
             cur->on = cur->master;
             char sec[NAME_MAX];
