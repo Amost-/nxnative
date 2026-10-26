@@ -15,6 +15,7 @@ How the host meets each part of a Switch game, and every failure met so far, one
 | [nvn-objects.md](nvn-objects.md) | NVN object sizes, memory pools, command memory, queues and syncs, CPU-written textures, NVN entry points |
 | [rendering.md](rendering.md) | The replay on Metal: textures, passes and clears, blend / depth / stencil, vertex input, uniforms and ordering, conditional rendering; the Vulkan and OpenGL layers |
 | [shaders.md](shaders.md) | Shader containers by engine, control sections and code, translation, bindings and handles, shaders compiled at run time, pipelines and caches |
+| [cheats.md](cheats.md) | How cheats work on a Switch with Atmosphère (dmnt, the file, the VM, its behaviour on failure) and where this host differs |
 | [game-state.md](game-state.md) | Saves, scripted state, and game behaviour that looks like a host bug but is not |
 
 A new general finding goes into the file and section it belongs to, in the same form, with a line in the symptom index; a fact about one game goes into that game's note.

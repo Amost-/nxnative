@@ -5,18 +5,26 @@
 // The host applies the enabled cheats once per presented frame (hle_nvn.c dump_frame -> dm_cheats_present) and at a fixed
 // ~60 Hz from its own thread when the game is not presenting (window minimized, graphics suspended, start-up).
 // The cheat VM follows the reference implementation (Atmosphère stratosphere/dmnt/source/cheat/impl/dmnt_cheat_vm.cpp and
-// docs/features/cheats.md) in word order, conditions, loops (jump-back counters) and register semantics; one deliberate
-// difference: each cheat runs as its own program per pass (the reference concatenates them into one), so an unclosed
-// conditional in one cheat cannot swallow the next cheat's words. Implemented opcodes: 0 store static, 1 begin
+// docs/features/cheats.md; the semantics are written down in docs/reference/cheats.md) in word order, conditions, loops
+// (jump-back counters) and register semantics. A pass resets the registers once, then runs the masters and the enabled
+// cheats in file order sharing them, as the reference's ResetState over its one concatenated program does; one
+// deliberate difference: each cheat runs as its own program (the reference concatenates them into one), so an unclosed
+// conditional in one cheat cannot swallow the next cheat's words, and the loop tops, word indexes into the program
+// that set them, are reset per cheat: a loop end without its start jumps to the first word of its own cheat, not of the
+// whole program and never into another cheat's words. Implemented opcodes: 0 store static, 1 begin
 // conditional, 2 end / else, 3 loop, 4 load register static, 5 load register from memory, 6 store static to a register
 // address, 7 legacy arithmetic, 8 key-press conditional, A store register to memory, C0 register conditional, C3 static
 // registers (read 0x00..0x7F into a register, write a register to 0x80..0xFF; kept across passes, cleared when the file is
 // loaded; on a Switch an overlay tool fills the readable ones and reads the written ones, and nothing here does yet, so a
 // cheat reads 0). A cheat that uses anything else (register arithmetic 9, save / restore C1 / C2, the extended key-press C4,
 // pause / resume, the debug log, or an unknown form) is turned off before it ever runs, shown in the menu with
-// "(unsupported opcode N)"; only the reference's memory regions 0 (main NSO) and 1 (heap) are mapped here. Every access is
-// bounds-checked against the mapped main span and the opened heap: an out-of-range access turns the cheat off and logs a
-// [RED] line, and the game keeps running.
+// "(unsupported opcode N)". The reference's memory-type nybble selects 0 main NSO, 1 heap, 2 alias, 3 aslr, 4 absolute
+// and 5..F main, from the host's own layout. What an access reaches follows the kernel's debug rule as the reference has
+// it: a read any page the guest address block or a module maps, a write main (through its writable alias), the opened heap,
+// another module's data and any other mapped guest page, never another module's code nor the host's key page. A failed
+// access (an unmapped page: a pointer the game has not set yet, a loading screen) is ignored as on a Switch: a load leaves
+// the register as it was, a conditional compares against 0, a store writes nothing, and the cheat stays on and retries
+// next pass; the first failure of a cheat logs one [RED] line, the rest are counted into a note on its row.
 // Beyond the reference, all optional (a plain community file behaves as on a Switch):
 //   - an entry without code words is a label, never a cheat: a credits line, or EdiZon's [--SectionStart:Name--] /
 //     [--SectionEnd:Name--] markers, which give the entries between them a section; a header glued to the previous line's
@@ -44,11 +52,12 @@
 #include <libkern/OSCacheControl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <mach/mach.h>       // vm_read_overwrite / vm_write: guest pages the game maps and unmaps while a pass runs (guest_page_read / _write)
 #if !TARGET_OS_IPHONE
-#include <mach/mach.h>       // the alias mapping of main's pages (mach_vm_remap), below
-#include <mach/mach_vm.h>
+#include <mach/mach_vm.h>    // the alias mapping of main's pages (mach_vm_remap), below; the iPhone SDK has no mach_vm.h
 #include <mach/vm_prot.h>
 #endif
+#include <dispatch/dispatch.h>   // the state files are written off the presenting thread (files_queue)
 #include <errno.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -80,7 +89,13 @@ typedef struct {
     uint8_t master;            // {Name} header: always on, applied first, not toggleable from the menu
     uint8_t on;                // switched on (masters always; everyone else by the menu's saved <build>.enabled state)
     uint8_t broken;            // unsupported opcode / region / width / condition, or malformed: shown disabled, never runs
-    uint8_t dead;              // an out-of-range access at run time turned it off (until the next reload of the file)
+    uint8_t dead;              // its program failed at run time (a runaway loop, an else at depth 0, a write into the host's key page):
+                               // off until the next reload of the file. A failed memory access never sets it (fails below)
+    uint32_t fails;            // accesses that failed since the file was loaded (an unmapped page): ignored like the reference does,
+                               // counted into the row's note; the first one logs a [RED] line
+    uint8_t pass_fail;         // an access failed in the pass running now (the note stays while the latest pass had one)
+    uint8_t noted;             // why holds the failed-access note (cleared, with why, by the first pass without a failure)
+    uint64_t note_ns;          // when the note was last rewritten (cheat_fail rewrites it sparingly: the panel reads why unlocked)
     uint8_t label;             // no code words (and no meta action): a credits line or a section marker, never a cheat
     uint8_t sec_mark;          // 1 = [--SectionStart:…--], 2 = [--SectionEnd:…--]
     uint8_t once;              // meta "set": runs one pass, then turns itself off
@@ -93,7 +108,8 @@ typedef struct {
     uint8_t pair_off;          // the off (restore) half of an on / off pair
     int pair;                  // the other half of an on / off pair, -1 none
     int dup;                   // how many earlier entries carry the same name (its <build>.enabled key is "Name #dup+1")
-    char why[80];              // the disabled state the menu shows (with the reason), filled at load or at run time
+    char why[80];              // the reason text the menu appends to the name: the disabled state (broken, dead) filled at load or
+                               // at run time, or, on a running cheat, the failed-access note (" (no effect: N accesses …)")
     char section[NAME_MAX];    // the section it lies in ("" outside any)
     char note[200];            // the meta file's "resolved" and "note", for the panel's tooltip
     char type[8];              // the meta type (u8 … u64, s8 … s64, f32, f64), "" unknown
@@ -132,8 +148,11 @@ static _Atomic int g_inited;   // dm_cheats_init done (the thread keeps running 
 
 // Region 0: the guest main NSO as the loader mapped it (dm/host/loader.c map_image: text pages and the patch area
 // read+execute, data and bss read+write, the host's key page read-only at the image's end); region 1: the heap,
-// whose opened extent grows and shrinks as the game's heap does (hle_svc.c)
+// whose opened extent grows and shrinks as the game's heap does (hle_svc.c); regions 2 (alias) and 3 (aslr) from the
+// same file's layout (region_base)
 static module_t *g_main_mod;   // the "main" module of the profile (not an NRO), found at init; its loaded fields come from loader.c
+int dm_guest_as_contains(uintptr_t a);              // hle_svc.c: the address lies in the reserved guest address block
+void svc_guest_range(uint8_t **base, size_t *size); // hle_svc.c: that block (the aslr region of GetInfo), NULL before mem_init
 
 // A second mapping of main's memory (same physical pages, mach_vm_remap with copy = false), protected read+write for the
 // whole process: a cheat's write to a code page goes through it while the game's own mapping stays executable. Toggling
@@ -191,8 +210,9 @@ static void dry_line(const char *fmt, ...) {
     if (g_dry_len + 1 < g_dry_cap) { g_dry_out[g_dry_len++] = '\n'; g_dry_out[g_dry_len] = 0; }
 }
 
-// A cheat turned itself off for good (until the file is reloaded): the menu shows it disabled with the reason. In a dry
-// run the reason is only described: a preview must never change the cheat
+// A cheat turned itself off for good (until the file is reloaded): its program cannot run here (a runaway loop, an else
+// at depth 0, a write into the host's key page), and the menu shows it disabled with the reason. Never for a failed
+// memory access (cheat_fail). In a dry run the reason is only described: a preview must never change the cheat
 static void cheat_kill(cheat_t *c, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     char msg[160]; vsnprintf(msg, sizeof msg, fmt, ap);
@@ -200,8 +220,34 @@ static void cheat_kill(cheat_t *c, const char *fmt, ...) {
     if (g_dry) { dry_line("stops: %s", msg); return; }
     if (c->dead) return;
     c->dead = 1;
+    c->noted = 0;   // why now holds the kill reason, which note_settle must never erase as a stale failed-access note
     snprintf(c->why, sizeof c->why, " (off: %s)", msg);
     LOG("[RED] cheat \"%s\": %s, turning it off", c->name, msg);
+}
+
+// A memory access of a cheat failed (what: "read" / "write", at the guest address the VM computed; why: the page's state).
+// The reference discards the failure and goes on (docs/reference/cheats.md, "Behaviour on failure": "The cheat stays
+// enabled and the pass goes on. It is retried on the next pass"), and so does this: the caller leaves its destination
+// as it was. The cheat is never turned off, since the usual cause is a pointer the game has not set yet (start-up, a
+// loading screen) and the cheat must start working once it is. The first failure of a cheat logs one [RED] line, every
+// one is counted, and the row's reason text carries the count as a note while the cheat's latest pass had a failure
+// (cheats_pass clears it on the first pass without one, so a cheat that works now shows no stale note). A dry run only
+// describes it
+static void cheat_fail(cheat_t *c, const char *what, uint64_t addr, const char *why) {
+    if (g_dry) { dry_line("%s at guest address 0x%llx fails (%s): ignored, retried next pass", what, (unsigned long long)addr, why); return; }
+    c->pass_fail = 1;
+    if (c->fails < UINT32_MAX) c->fails++;
+    if (c->fails == 1) LOG("[RED] cheat \"%s\": %s at guest address 0x%llx fails (%s): ignored like a Switch does, retried every pass (counted on its row from now on)", c->name, what, (unsigned long long)addr, why);
+    if (c->dead || c->broken) return;   // a dead cheat keeps its own reason (its never-decrease state may still read)
+    // The panel reads why without the lock (a stale row is accepted, a torn one is not worth 60 rewrites a second): the
+    // note is rewritten only when its count is a power of two or a second has passed since the last rewrite, so a cheat
+    // failing every pass changes its text a few times a minute, with the count exact at each rewrite
+    uint64_t now = now_ns();
+    if ((c->fails & (c->fails - 1)) == 0 || now - c->note_ns >= 1000000000ull) {
+        snprintf(c->why, sizeof c->why, " (no effect: %u access%s out of mapped memory)", c->fails, c->fails == 1 ? "" : "es");
+        c->note_ns = now;
+    }
+    c->noted = 1;
 }
 
 // ---------- decode: one decoder for both the load verdict and the run ----------
@@ -219,15 +265,20 @@ static unsigned op_kind(uint32_t w) {
 // own end / else, so each of these increases the depth counter
 static int op_cond_begin(unsigned op) { return op == 1 || op == 8 || op == 0xC0 || op == 0xC4; }
 
+// The reason of the last decode failure (UNSUP / ins_unsupported), for the run's own message. A dry run never marks the
+// cheat (a preview must leave it as it was: the decoder runs under the dry flag only from vm_run / vm_skip, and a
+// failure there is described, not recorded), so the reason lives here rather than only in c->why
+static char g_dec_why[48];
+
 // Unsupported opcode, with the reference's own opcode name in the menu label ("unsupported opcode 9", "… FF0")
 static int ins_unsupported(cheat_t *c, const uint32_t *p) {
-    snprintf(c->why, sizeof c->why, " (unsupported opcode %X)", op_kind(p[0]));
-    c->broken = 1;
+    snprintf(g_dec_why, sizeof g_dec_why, "unsupported opcode %X", op_kind(p[0]));
+    if (!g_dry) { snprintf(c->why, sizeof c->why, " (%s)", g_dec_why); c->broken = 1; }
     return 0;
 }
 
 // One unsupported verdict, of the reasons the reference can still decode but the host does not run
-#define UNSUP(c, what) { snprintf((c)->why, sizeof (c)->why, " (%s)", what); (c)->broken = 1; return 0; }
+#define UNSUP(c, what) { snprintf(g_dec_why, sizeof g_dec_why, "%s", what); if (!g_dry) { snprintf((c)->why, sizeof (c)->why, " (%s)", what); (c)->broken = 1; } return 0; }
 
 // The instruction the way the run and the load verdict must both see it: fields from the reference's decode, one place.
 // rel = the 40-bit (36-bit for A / C0) relative address, val = the static value / a loop's iterations / the key mask;
@@ -242,7 +293,9 @@ static int width_ok(unsigned t) { return t == 1 || t == 2 || t == 4 || t == 8; }
 
 // Decode the instruction at p (n words left) or 0 when it cannot run here (c->why: why). Mirrors the reference
 // DecodeNextOpcode field by field, so the run never miscounts a word; outside what the host implements
-// (opcodes 0..8, A, C0, C3 with the reference's value widths and its six comparisons) the verdict is unsupported
+// (opcodes 0..8, A, C0, C3 with the reference's value widths and its six comparisons) the verdict is unsupported. The
+// memory-type nybble is never a verdict: every value selects a base (region_base), as the reference's
+// GetCheatProcessAddress has a base for each (5..F share main's)
 static int ins_dec(cheat_t *c, const uint32_t *p, int n, ins_t *o) {
     unsigned t;
     if (n <= 0) UNSUP(c, "truncated");
@@ -253,7 +306,7 @@ static int ins_dec(cheat_t *c, const uint32_t *p, int n, ins_t *o) {
         case 0: {   // 0TMR00AA AAAAAAAA VVVVVVVV (VVVVVVVV): store the value at memory base + rel + reg[r]
                     // (the reference adds the offset register unconditionally: all registers start at 0)
             if ((t = (w >> 24) & 0xF, !width_ok(t))) UNSUP(c, "width");
-            if ((o->m = (w >> 20) & 0xF) > 1) UNSUP(c, "region");
+            o->m = (w >> 20) & 0xF;
             o->t = t; o->r = (w >> 16) & 0xF;
             if (n < 2) UNSUP(c, "truncated");
             o->rel = ((uint64_t)(w & 0xFF) << 32) | p[1];
@@ -265,7 +318,7 @@ static int ins_dec(cheat_t *c, const uint32_t *p, int n, ins_t *o) {
         } break;
         case 1: {   // 1TMCXrAA AAAAAAAA VVVVVVVV (VVVVVVVV): compare memory at base + rel (+ reg[x] for X=1) with the value
             if ((t = (w >> 24) & 0xF, !width_ok(t))) UNSUP(c, "width");
-            if ((o->m = (w >> 20) & 0xF) > 1) UNSUP(c, "region");
+            o->m = (w >> 20) & 0xF;
             o->t = t; o->c = (w >> 16) & 0xF;
             if (o->c < 1 || o->c > 6) UNSUP(c, "condition");   // only the six comparisons run
             o->flags = ((w >> 12) & 0xF) != 0;                 // X, taken as a boolean like the reference does
@@ -300,7 +353,6 @@ static int ins_dec(cheat_t *c, const uint32_t *p, int n, ins_t *o) {
             o->t = t; o->m = (w >> 20) & 0xF; o->r = (w >> 16) & 0xF;
             o->flags = (w >> 12) & 0xF; o->x = (w >> 8) & 0xF;   // flags: 0 fixed, 1 reg[r] + rel, 2 reg[x] + rel, 3 region + reg[x] + rel
             if (o->flags > 3) UNSUP(c, "operand");
-            if ((o->flags == 0 || o->flags == 3) && o->m > 1) UNSUP(c, "region");
             if (n < 2) UNSUP(c, "truncated");
             o->rel = ((uint64_t)(w & 0xFF) << 32) | p[1]; o->len = 2;
         } break;
@@ -319,8 +371,10 @@ static int ins_dec(cheat_t *c, const uint32_t *p, int n, ins_t *o) {
             if (n < 2) UNSUP(c, "truncated");
             o->val = p[1]; o->len = 2;
         } break;
-        case 8:     // 8kkkkkkk: every key of the mask held; the DM_BTN_* bit order, the sticks' directions on 16..23
-                    // (dm_input.h); SL / SR on 24 / 25 can never be held, no input source of this host reports them
+        case 8:     // 8kkkkkkk: a 28-bit mask, every key of it held on any controller (the reference ORs the held keys of
+                    // the handheld and players 1..8; dm_cheats_keys ORs every input source the same way). The DM_BTN_*
+                    // bit order (nn::hid::NpadButton), the sticks' directions on 16..23 (dm_input.h); the Joy-Cons' SL / SR
+                    // on 24..27 can never be held here, no input source of this host reports them, so such a mask is never met
             o->val = w & 0x0FFFFFFFu;
             break;
         case 0xA: { // ATSRIOxa (aaaaaaaa): store reg[s] (width T) at an address from reg[r] and the offset type O:
@@ -330,7 +384,7 @@ static int ins_dec(cheat_t *c, const uint32_t *p, int n, ins_t *o) {
             o->t = t; o->s = (w >> 20) & 0xF; o->r = (w >> 16) & 0xF;
             o->flags = ((w >> 12) & 0xF) != 0; o->o = (w >> 8) & 0xF; o->x = (w >> 4) & 0xF;
             if (o->o > 5) UNSUP(c, "operand");
-            if (o->o >= 3) { o->m = o->x; if (o->m > 1) UNSUP(c, "region"); }
+            if (o->o >= 3) o->m = o->x;
             if (o->o == 2 || o->o == 4 || o->o == 5) {
                 if (n < 2) UNSUP(c, "truncated");
                 o->rel = ((uint64_t)(w & 0xF) << 32) | p[1]; o->len = 2;
@@ -345,7 +399,7 @@ static int ins_dec(cheat_t *c, const uint32_t *p, int n, ins_t *o) {
             o->s = (w >> 12) & 0xF; o->o = (w >> 8) & 0xF;
             switch (o->o) {
                 case 0: case 1:
-                    if ((o->m = (w >> 4) & 0xF) > 1) UNSUP(c, "region");
+                    o->m = (w >> 4) & 0xF;
                     if (o->o == 1) { o->x = w & 0xF; break; }
                     if (n < 2) UNSUP(c, "truncated");
                     o->rel = ((uint64_t)(w & 0xF) << 32) | p[1]; o->len = 2;
@@ -374,23 +428,74 @@ static int ins_dec(cheat_t *c, const uint32_t *p, int n, ins_t *o) {
     return (int)o->len;
 }
 
-// ---------- guest memory: the spans a cheat may touch, and the accesses into them ----------
+// ---------- guest memory: what a cheat may reach, and the accesses into it ----------
 
-// The span that contains the host pointer range [addr, addr+len). kind 0 = main's mapped image, kind 1 = the currently
-// opened heap; NULL when any byte of the range is unmapped (rel_base is optional: callers that log only the raw guest
-// address pass NULL)
-static uint8_t *span_get(uint64_t addr, uint64_t len, int *kind, uint64_t *rel_base) {
+// Where the guest range [addr, addr+len) lies, the kinds in the order they are tried:
+//   WH_MAIN    main's mapped image: read directly (the loader's protections never change after load), written through
+//              the alias (main_write_pages)
+//   WH_HEAP    the currently opened heap: read and written under hle_svc.c's g_map_lock (dm_guest_heap_read / _write),
+//              so a concurrent SetHeapSize cannot mprotect the span away under the copy
+//   WH_MODULE  another module (an NSO of the profile, an NRO): mapped for the process's lifetime like main, read
+//              directly; only its data and bss are written (never its code or read-only data, never its key page)
+//   WH_GUEST   any other page of the reserved guest address block: thread stacks, the alias region's virtual address
+//              memory (MapPhysicalMemory), MapMemory'd pages. The game maps and unmaps these while a pass runs and no
+//              lock of this file covers them, so the copies go through the kernel (vm_read_overwrite / vm_write), which
+//              fail instead of faulting on a page gone PROT_NONE in between: the failure is then the reference's ignored
+//              access. The block is otherwise only known as a whole (dm_guest_as_contains); whether the page is mapped
+//              right now is what the copy itself answers
+//   -1         none of these (the host's own memory, a null pointer): refused without touching it. The reference reads
+//              any mapped page of the process, but the host process maps far more than the game's, none of it a cheat's
+// This is the reference's "What a read or write can reach is the kernel's rule, not the region" (docs/reference/cheats.md,
+// Memory regions), restricted to the game's own memory. base is the kind's base for the player-facing name (addr_name)
+enum { WH_MAIN = 0, WH_HEAP = 1, WH_MODULE = 2, WH_GUEST = 3 };
+typedef struct { int kind; module_t *mod; uint64_t base; } where_t;
+static int where_get(uint64_t addr, uint64_t len, where_t *w) {
+    w->kind = -1; w->mod = NULL; w->base = 0;
+    if (!len || addr + len < addr) return -1;
     if (g_main_mod) {
         uint64_t b = (uint64_t)(uintptr_t)g_main_mod->base, off = addr - b;
-        if (addr >= b && off < g_main_mod->size && len <= g_main_mod->size - off) {
-            *kind = 0; if (rel_base) *rel_base = b; return (uint8_t *)(uintptr_t)addr;
-        }
+        if (addr >= b && off < g_main_mod->size && len <= g_main_mod->size - off) { w->kind = WH_MAIN; w->mod = g_main_mod; w->base = b; return 0; }
+    }
+    for (int i = 0; i < g_nmod; i++) {   // the other modules of the loader's table (NSOs and NROs, all mapped at start)
+        module_t *m = &g_mod[i];
+        if (m == g_main_mod || !m->base || !m->size) continue;
+        uint64_t b = (uint64_t)(uintptr_t)m->base, off = addr - b;
+        if (addr >= b && off < m->size && len <= m->size - off) { w->kind = WH_MODULE; w->mod = m; w->base = b; return 0; }
     }
     uint64_t hb; size_t hopen; dm_guest_heap_range(&hb, &hopen);
-    if (hb && hopen && addr >= hb && addr - hb < hopen && len <= hopen - (addr - hb)) {
-        *kind = 1; if (rel_base) *rel_base = hb; return (uint8_t *)(uintptr_t)addr;
+    if (hb && hopen && addr >= hb && addr - hb < hopen && len <= hopen - (addr - hb)) { w->kind = WH_HEAP; w->base = hb; return 0; }
+    if (dm_guest_as_contains((uintptr_t)addr) && dm_guest_as_contains((uintptr_t)(addr + len - 1))) {
+        uint8_t *as = NULL; size_t n = 0; svc_guest_range(&as, &n);
+        w->kind = WH_GUEST; w->base = (uint64_t)(uintptr_t)as; return 0;
     }
-    return NULL;
+    return -1;
+}
+
+// Copy len bytes of a WH_GUEST page out (0) or fail (-1) without faulting: the kernel's copy refuses an unmapped or
+// PROT_NONE page (KERN_INVALID_ADDRESS / KERN_PROTECTION_FAILURE) where a memcpy would take the signal
+static int guest_page_read(uint64_t addr, void *out, uint64_t len) {
+    vm_size_t got = 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)addr, (vm_size_t)len, (vm_address_t)(uintptr_t)out, &got) == KERN_SUCCESS && got == len ? 0 : -1;
+}
+
+// The counterpart for a write: the write-protect dirty tracking of the graphics layer is told first (a page it holds
+// read-only is unprotected and marked dirty, as every guest write path does), then the kernel copies, failing on a page
+// that is not mapped writable right now
+static int guest_page_write(uint64_t addr, const void *src, uint64_t len) {
+    dm_guest_write_prepare((void *)(uintptr_t)addr, (size_t)len);
+    return vm_write(mach_task_self(), (vm_address_t)addr, (vm_offset_t)(uintptr_t)src, (mach_msg_type_number_t)len) == KERN_SUCCESS ? 0 : -1;
+}
+
+// Read len bytes at a guest address into a zero-extended little-endian value: 0, or -1 when the range is not readable
+// right now (where_get refused it, or the page went away). No consequence for any cheat: cheat_read adds the accounting
+static int mem_read(uint64_t addr, uint64_t len, uint64_t *out) {
+    where_t w; uint64_t v = 0;
+    if (where_get(addr, len, &w)) return -1;
+    if (w.kind == WH_HEAP) { if (dm_guest_heap_read(addr, &v, len)) return -1; }
+    else if (w.kind == WH_GUEST) { if (guest_page_read(addr, &v, len)) return -1; }
+    else memcpy(&v, (void *)(uintptr_t)addr, len);
+    *out = v;
+    return 0;
 }
 
 // Cheats writing into main's pages (dmnt's WriteCheatProcessMemoryUnsafe on this host): if the writable alias of main
@@ -440,20 +545,19 @@ static int main_write_pages(cheat_t *c, uint64_t addr, uint64_t len, const void 
 
 // Read len bytes at a guest address without any consequence for a cheat: 0 and the value, or -1 when unmapped (the dry run
 // and the preview's current values use it)
-static int peek(uint64_t addr, uint64_t len, uint64_t *out) {
-    int kind = -1; uint64_t v = 0;
-    if (!span_get(addr, len, &kind, NULL)) return -1;
-    if (kind == 1) { if (dm_guest_heap_read(addr, &v, len)) return -1; }
-    else memcpy(&v, (void *)(uintptr_t)addr, len);
-    *out = v;
-    return 0;
-}
+static int peek(uint64_t addr, uint64_t len, uint64_t *out) { return mem_read(addr, len, out); }
 
-// A guest address the way a player reads it: main+0x…, heap+0x… or the bare address
+static uint64_t region_base(int m);
+
+// A guest address the way a player reads it: main+0x…, heap+0x…, alias+0x… (the reference's regions), <module>+0x… for
+// another module, or the bare address (a stack, an unmapped page)
 static void addr_name(uint64_t addr, char *out, size_t n) {
-    int kind = -1; uint64_t base = 0;
-    if (span_get(addr, 1, &kind, &base)) snprintf(out, n, "%s+0x%llX", kind == 0 ? "main" : "heap", (unsigned long long)(addr - base));
-    else snprintf(out, n, "0x%llX", (unsigned long long)addr);
+    where_t w;
+    uint64_t ab = region_base(2);
+    if (where_get(addr, 1, &w) || w.kind == WH_GUEST) {
+        if (ab && addr >= ab && addr - ab < (uint64_t)DM_GAME_MEM_ALIAS) snprintf(out, n, "alias+0x%llX", (unsigned long long)(addr - ab));
+        else snprintf(out, n, "0x%llX", (unsigned long long)addr);
+    } else snprintf(out, n, "%s+0x%llX", w.kind == WH_MAIN ? "main" : w.kind == WH_HEAP ? "heap" : w.mod->name, (unsigned long long)(addr - w.base));
 }
 
 // The width in bytes of a meta type ("u16" -> 2), 0 when unknown
@@ -471,12 +575,27 @@ static void value_text(const cheat_t *c, unsigned width, uint64_t v, char *out, 
 }
 
 // dmnt's WriteCheatProcessMemoryUnsafe for this host: val's low len bytes, little-endian (guest aarch64 = host arm64),
-// into the span. A refusal turns the cheat off (cheat_kill) and logs a [RED] line; the game keeps running. The guest
-// address is logged as the cheat VM computes it (region base + rel + offset register), which is what the player reads
-// in the cheat file's own terms. In a dry run the write is described (where, the value there now, the new value) instead
+// into the page where_get finds. A range that is not writable (unmapped, another module's code, the host's own memory)
+// is a failed access: nothing is written and the cheat goes on (cheat_fail; the reference discards a failed write the
+// same way), except a write into the host's key page, which main_write_pages refuses for good. The guest address is
+// logged as the cheat VM computes it (region base + rel + offset register), which is what the player reads in the cheat
+// file's own terms. In a dry run the write is described (where, the value there now, the new value) instead
 static void cheat_write(cheat_t *c, uint64_t addr, uint64_t len, uint64_t val) {
-    int kind = -1;
-    if (!span_get(addr, len, &kind, NULL)) { cheat_kill(c, "out of mapped memory: write to guest address 0x%llx", (unsigned long long)addr); return; }
+    where_t w;
+    if (where_get(addr, len, &w)) { cheat_fail(c, "write", addr, "not mapped"); return; }
+    if (w.kind == WH_MODULE) {   // another module: only what the loader mapped writable (loader.c map_image). Refused: the
+                                 // code and read-only data before data_off (read + execute), the key page (read-only), and the
+                                 // patch area, which with patch_off >= 0 lies after the key page up to the image's end, page
+                                 // rounded down as the loader sealed it read + execute: a memcpy into any of these is a SIGBUS
+        static long pg; if (!pg) pg = getpagesize();
+        uint64_t off = addr - w.base, m_data = w.mod->data_off, kp0 = w.mod->key_page_off, kp1 = kp0 + w.mod->key_page_size;
+        uint64_t po = w.mod->patch_off >= 0 ? (uint64_t)w.mod->patch_off & ~(uint64_t)(pg - 1) : (uint64_t)w.mod->size;
+        if (off < m_data || (off < kp1 && off + len > kp0) || off + len > po) {
+            char why[80]; snprintf(why, sizeof why, "code, read-only data, key page or patch area of module %s", w.mod->name);
+            cheat_fail(c, "write", addr, why);
+            return;
+        }
+    }
     if (g_dry) {
         char where[48], now[48], new_[48]; uint64_t cur = 0;
         addr_name(addr, where, sizeof where);
@@ -486,51 +605,84 @@ static void cheat_write(cheat_t *c, uint64_t addr, uint64_t len, uint64_t val) {
         g_dry_writes++;
         return;
     }
-    if (atomic_load(&g_dbg)) LOG("cheat \"%s\": write %llu bytes of 0x%llx at guest address 0x%llx (%s)", c->name, (unsigned long long)len, (unsigned long long)val, (unsigned long long)addr, kind == 0 ? "main NSO" : "heap");
-    if (kind == 0) main_write_pages(c, addr, len, &val);
-    // The heap write happens under the memory lock (dm_guest_heap_write), so a concurrent SetHeapSize cannot shrink it
-    // out from under the copy; it only refuses if the span shrank since the span check a moment ago: out of range as ever
-    else if (dm_guest_heap_write(addr, &val, len)) cheat_kill(c, "out of mapped memory: write to guest address 0x%llx", (unsigned long long)addr);
+    if (atomic_load(&g_dbg)) LOG("cheat \"%s\": write %llu bytes of 0x%llx at guest address 0x%llx (%s)", c->name, (unsigned long long)len, (unsigned long long)val, (unsigned long long)addr,
+                                 w.kind == WH_MAIN ? "main NSO" : w.kind == WH_HEAP ? "heap" : w.kind == WH_MODULE ? w.mod->name : "guest page");
+    int bad = 0;
+    switch (w.kind) {
+        case WH_MAIN: main_write_pages(c, addr, len, &val); break;
+        // The heap write happens under the memory lock (dm_guest_heap_write), so a concurrent SetHeapSize cannot shrink it
+        // out from under the copy; it only refuses if the span shrank since the check a moment ago: a failed access as ever
+        case WH_HEAP: bad = dm_guest_heap_write(addr, &val, len) != 0; break;
+        case WH_MODULE: dm_guest_write_prepare((void *)(uintptr_t)addr, (size_t)len); memcpy((void *)(uintptr_t)addr, &val, len); break;
+        default: bad = guest_page_write(addr, &val, len) != 0; break;
+    }
+    if (bad) cheat_fail(c, "write", addr, "page not mapped writable");
 }
 
-// dmnt's ReadCheatProcessMemoryUnsafe for this host: the mapped main span and the opened heap are both readable; the
-// value is assembled zero-extended little-endian
+// dmnt's ReadCheatProcessMemoryUnsafe for this host: the value is assembled zero-extended little-endian from any page
+// where_get accepts; 0, or -1 with the failure counted (cheat_fail) and *out untouched, so the caller leaves its
+// destination as it was (opcode 5 keeps the register, 1 / C0 compare against the 0 they started from)
 static int cheat_read(cheat_t *c, uint64_t addr, uint64_t len, uint64_t *out) {
-    int kind = -1;
-    if (!span_get(addr, len, &kind, NULL)) { cheat_kill(c, "out of mapped memory: read at guest address 0x%llx", (unsigned long long)addr); return -1; }
-    uint64_t v = 0;
-    // The heap read is hole-free like its write counterpart: a span that shrank since the span check refuses here
-    // instead of faulting on a page a concurrent SetHeapSize mprotect'd away
-    if (kind == 1) { if (dm_guest_heap_read(addr, &v, len)) { cheat_kill(c, "out of mapped memory: read at guest address 0x%llx", (unsigned long long)addr); return -1; } }
-    else memcpy(&v, (void *)(uintptr_t)addr, len);
-    *out = v;
-    return 0;
+    if (mem_read(addr, len, out) == 0) return 0;
+    cheat_fail(c, "read", addr, "not mapped");
+    return -1;
 }
 
 // ---------- the cheat VM: one pass ----------
 
-static uint64_t g_reg[16], g_looptop[16];   // the reference's registers and loop tops (its saved values belong to C1/C2, not implemented)
+static uint64_t g_reg[16];     // the reference's registers: reset once per pass, shared by its cheats (its saved values belong to C1/C2, not implemented)
+static uint64_t g_looptop[16]; // the reference's loop tops, word indexes into the program that set them; each cheat is its own
+                               // program here, so they are reset at the start of every cheat (vm_run): a loop end without
+                               // its start jumps to word 0 of its own cheat, never to an index inside another cheat's words
 static uint64_t g_static[256];              // the reference's static registers (C3): kept across passes, cleared on load
 
-// Region base for kind m: 0 main NSO, 1 heap. The caller checks region_ready(m) first: with no span open the base is
-// 0, and a cheat resolved against 0 could by luck fall inside main's mapped span, which an out-of-range-style [RED]
-// line then does not explain
+// Region base for the memory-type nybble m, the reference's GetCheatProcessAddress table (docs/reference/cheats.md,
+// Memory regions): 0 main NSO, 1 heap, 2 alias, 3 aslr, 4 non-relative (the offset is an absolute address), 5..F main
+// (the reference's default case). The bases come from the host's own layout: main from the loader, the heap and the
+// block from hle_svc.c (dm_guest_heap_range, svc_guest_range), and the alias region from that file's fixed partition
+// (mem_init_once: alias, then the profile's stack region, then the heap, so alias = heap - stack - alias sizes); the
+// aslr base check in region_ready keeps a changed partition from silently misplacing region 2. The caller checks
+// region_ready(m) first: with no span open the base is 0, and a cheat resolved against 0 could by luck fall inside
+// main's mapped span, which a failed-access line then does not explain
 static uint64_t region_base(int m) {
-    if (m == 0) return g_main_mod ? (uint64_t)(uintptr_t)g_main_mod->base : 0;
-    uint64_t hb; size_t hopen; dm_guest_heap_range(&hb, &hopen);
-    return hb && hopen ? hb : 0;
+    uint64_t hb; size_t hopen;
+    switch (m) {
+        case 1: dm_guest_heap_range(&hb, &hopen); return hb && hopen ? hb : 0;
+        case 2: dm_guest_heap_range(&hb, &hopen); return hb ? hb - (uint64_t)DM_GAME_MEM_STACK - (uint64_t)DM_GAME_MEM_ALIAS : 0;
+        case 3: { uint8_t *as = NULL; size_t n = 0; svc_guest_range(&as, &n); return (uint64_t)(uintptr_t)as; }
+        case 4: return 0;
+        default: return g_main_mod ? (uint64_t)(uintptr_t)g_main_mod->base : 0;
+    }
 }
 
-// The named region must have its span open right now: a cheat that names the heap (region 1) before the game's first
+// The named region must have its base right now: a cheat that names the heap (region 1) before the game's first
 // SetHeapSize would compute its addresses from base 0, so its pass stops here and it waits (logged once): a cheat turned
-// on from <build>.enabled at launch runs as soon as the game opens its heap instead of being turned off before that
+// on from <build>.enabled at launch runs as soon as the game opens its heap instead of failing its accesses before that.
+// The alias region (2) is ready as soon as the block is reserved, which is before any cheat runs; its base must agree
+// with the block's partition (alias = block + 256 MB in hle_svc.c mem_init_once), else region 2 stays refused, logged once
 static int region_ready(cheat_t *c, int m) {
-    if (m == 0) return g_main_mod != NULL;   // main is always mapped by the time a cheat file was picked
-    uint64_t hb; size_t hopen; dm_guest_heap_range(&hb, &hopen);
-    if (hb && hopen) return 1;
-    if (g_dry) dry_line("waits: region 1 (heap) has no span opened yet");
-    else if (!c->heap_wait) { c->heap_wait = 1; LOG("cheats: \"%s\" waits for the game's heap (region 1 has no span opened yet)", c->name); }
-    return 0;
+    if (m == 1) {
+        uint64_t hb; size_t hopen; dm_guest_heap_range(&hb, &hopen);
+        if (hb && hopen) return 1;
+        if (g_dry) dry_line("waits: region 1 (heap) has no span opened yet");
+        else if (!c->heap_wait) { c->heap_wait = 1; LOG("cheats: \"%s\" waits for the game's heap (region 1 has no span opened yet)", c->name); }
+        return 0;
+    }
+    if (m == 2) {
+        static int warned;
+        uint64_t ab = region_base(2), as = region_base(3);
+        if (!ab || !as) {   // the block is not reserved yet (the idle thread passes from start-up, before mem_init): wait, silently
+            if (g_dry) dry_line("waits: region 2 (alias) is not reserved yet");
+            return 0;
+        }
+        if (ab == as + 0x10000000ull) return 1;
+        if (g_dry) dry_line("stops: region 2 (alias) is not where the host's layout puts it");
+        else if (!warned++) LOG("[RED] cheat \"%s\": region 2 (alias) refused: its base 0x%llx is not the guest block 0x%llx + 256 MB (hle_svc.c mem_init_once changed its partition)", c->name, (unsigned long long)ab, (unsigned long long)as);
+        return 0;
+    }
+    if (m == 3) return region_base(3) != 0;
+    if (m == 4) return 1;
+    return g_main_mod != NULL;   // main is always mapped by the time a cheat file was picked
 }
 
 // Skipping a failed / finished conditional the reference's way: walk nested begins and ends (each counted once at its
@@ -566,11 +718,12 @@ static int vm_run(cheat_t *c) {
     const uint32_t *ins = c->ins; int nins = c->nins;
     int idx = 0, depth = 0;   // like the reference Execute: one instruction pointer, one conditional depth
     long steps = 0;
+    memset(g_looptop, 0, sizeof g_looptop);   // loop tops index this cheat's own words (see their declaration); the registers stay
     while (idx < nins) {
         if (++steps > VM_STEP_CAP) { cheat_kill(c, "over %d instructions in one pass: runaway loop", VM_STEP_CAP); return -1; }
         ins_t in;
         int len = ins_dec(c, ins + idx, nins - idx, &in);
-        if (len <= 0) { cheat_kill(c, "malformed instruction at word %d%s", idx, c->why); return -1; }
+        if (len <= 0) { cheat_kill(c, "malformed instruction at word %d (%s)", idx, g_dec_why); return -1; }
         switch (in.op) {
             case 0: {   // static store: base + rel + reg[r] (the bounds check is the span check inside cheat_write)
                 if (!region_ready(c, in.m)) return -1;
@@ -578,41 +731,43 @@ static int vm_run(cheat_t *c) {
             } break;
             case 8: case 1: {   // key-press conditional (8) / memory conditional (1): depth counted like the reference, before the verdict
                 depth++;
-                int met = 1, run = 1;
+                int met = 1;
                 if (in.op == 8) {
                     met = (dm_cheats_keys() & in.val) == in.val;   // every key of the mask held
                 } else {
                     if (!region_ready(c, in.m)) return -1;   // the conditional reads the region it names
+                    // The reference reads into a zeroed value and compares whatever is there afterwards: a failed read
+                    // (counted by cheat_read) compares against 0, as docs/reference/cheats.md has it ("opcodes 1 and C0
+                    // compare against 0")
                     uint64_t src = 0;
-                    if (cheat_read(c, region_base(in.m) + in.rel + (in.flags ? g_reg[in.x] : 0), in.t, &src) == 0)
-                        met = cond_met(in.c, src & width_mask(in.t), in.val & width_mask(in.t));
-                    else run = 0;   // the read could not be done: the cheat is off (cheat_read logged the [RED] line)
+                    cheat_read(c, region_base(in.m) + in.rel + (in.flags ? g_reg[in.x] : 0), in.t, &src);
+                    met = cond_met(in.c, src & width_mask(in.t), in.val & width_mask(in.t));
                 }
-                if (!run) return -1;
                 if (!met) { idx += len; if (vm_skip(c, ins, nins, &idx, &depth, 1)) return -1; continue; }   // block (else too) skipped
             } break;
-            case 0xC0: {   // register conditional: reg[s] against memory, a static value or another register, a block like 1's
+            case 0xC0: {   // register conditional: reg[s] against memory, a static value or another register, a block like 1's;
+                           // a memory operand that cannot be read stays 0 (the reference's zeroed value), the failure counted
                 depth++;
                 uint64_t want = 0, got = g_reg[in.s] & width_mask(in.t);
-                int ok = 0;
                 switch (in.o) {
-                    case 0: if (!region_ready(c, in.m)) return -1; ok = cheat_read(c, region_base(in.m) + in.rel, in.t, &want); break;
-                    case 1: if (!region_ready(c, in.m)) return -1; ok = cheat_read(c, region_base(in.m) + g_reg[in.x], in.t, &want); break;
-                    case 2: ok = cheat_read(c, g_reg[in.r] + in.rel, in.t, &want); break;
-                    case 3: ok = cheat_read(c, g_reg[in.r] + g_reg[in.x], in.t, &want); break;
+                    case 0: if (!region_ready(c, in.m)) return -1; cheat_read(c, region_base(in.m) + in.rel, in.t, &want); break;
+                    case 1: if (!region_ready(c, in.m)) return -1; cheat_read(c, region_base(in.m) + g_reg[in.x], in.t, &want); break;
+                    case 2: cheat_read(c, g_reg[in.r] + in.rel, in.t, &want); break;
+                    case 3: cheat_read(c, g_reg[in.r] + g_reg[in.x], in.t, &want); break;
                     case 4: want = in.val; break;
                     default: want = g_reg[in.x]; break;
                 }
-                if (ok) return -1;   // a memory operand could not be read: the cheat is off (cheat_read logged it)
                 if (!cond_met(in.c, got, want & width_mask(in.t))) { idx += len; if (vm_skip(c, ins, nins, &idx, &depth, 1)) return -1; continue; }
             } break;
             case 2:   // end / else of a conditional: an else skips its block, a plain end closes the block
-                if (in.flags) {   // an else: skip its block like the reference; an else at depth 0 is mismatched, and
-                                  // the reference treats that as a VM error (SkipConditionalBlock aborts at depth 0)
+                if (in.flags) {   // an else: skip its block like the reference. An else at depth 0 is mismatched: the
+                                  // reference aborts the whole of dmnt there (SkipConditionalBlock's R_ABORT_UNLESS on
+                                  // the depth), which no host can copy; turning that one cheat off for the session is
+                                  // the lenient choice, and the one file error the host keeps as a kill
                     if (depth == 0) { cheat_kill(c, "mismatched else at conditional depth 0"); return -1; }
                     idx += len; if (vm_skip(c, ins, nins, &idx, &depth, 0)) return -1; continue;
                 }
-                if (depth > 0) depth--;   // a plain end (nop at depth 0, the reference's own gracious assumption)
+                if (depth > 0) depth--;   // a plain end (a no-op at depth 0, the reference's own gracious assumption)
                 break;
             case 3:   // loop: start (counter set, jump-back point kept), end (decrement, jump back until it reaches 0)
                 if (!in.flags) { g_reg[in.r] = in.val; g_looptop[in.r] = idx + 2; idx += (int)in.len; continue; }
@@ -630,8 +785,10 @@ static int vm_run(cheat_t *c) {
                     case 2: addr = g_reg[in.x] + in.rel; break;
                     default: if (!region_ready(c, in.m)) return -1; addr = region_base(in.m) + g_reg[in.x] + in.rel; break;
                 }
-                if (cheat_read(c, addr, in.t, &v0) == 0) g_reg[in.r] = v0 & width_mask(in.t);
-                else return -1;   // the load could not be done: the cheat is off (cheat_read logged it)
+                // The reference reads the T bytes straight into the register's storage (little-endian): a load narrower
+                // than 8 bytes replaces the low T bytes and keeps the upper ones, it does not zero-extend
+                // (docs/reference/cheats.md, opcode 5). A failed read leaves the register as it was (counted by cheat_read)
+                if (cheat_read(c, addr, in.t, &v0) == 0) g_reg[in.r] = (g_reg[in.r] & ~width_mask(in.t)) | (v0 & width_mask(in.t));
             } break;
             case 6: {   // store the value at reg[r] (+ reg[x] for o=1); reg[r] gains the width for I=1, like the reference
                 cheat_write(c, g_reg[in.r] + (in.flags & 2 ? g_reg[in.x] : 0), in.t, in.val & width_mask(in.t));
@@ -704,27 +861,47 @@ static void nd_step(cheat_t *c) {
 
 static void states_save(void);
 
-// One pass: the masters first, then the enabled cheats in file order. The VM state (registers, loop tops) is fresh each
-// cheat, the reference's ResetState over its concatenated program; static registers stay. The lock is never waited for: a
-// pass that arrives while a menu operation or another pass runs is simply skipped (the next frame / tick applies again).
-// The master switch stops everything; safe mode holds the masters back too; a "set" cheat turns itself off after its pass
+// Does cheat c take part in a pass's half (0 = the masters, 1 = the enabled plain cheats in file order)? Not a broken,
+// dead or label entry, not a master in safe mode (they wait for the player too), not a plain cheat that is off. One
+// place for the pass and for the dry run, which replays the same order
+static int pass_runs(const cheat_t *c, int half) {
+    if (c->broken || c->dead || c->label) return 0;
+    if ((half == 0) != (c->master != 0)) return 0;
+    if (half == 0 && g_safe) return 0;
+    if (half && !c->on) return 0;
+    return 1;
+}
+
+// The failed-access note of one cheat after its run (cheat_fail): the latest pass had no failure, so a note from earlier
+// passes no longer describes it and goes (the count itself stays for the next failure's note)
+static void note_settle(cheat_t *c) {
+    if (c->noted && !c->pass_fail) { c->noted = 0; c->why[0] = 0; }
+}
+
+// One pass: the masters first, then the enabled cheats in file order, as the reference's LoadProgram orders them. The
+// registers are reset once per pass, before the first cheat, and shared by every cheat of the pass: the reference's
+// ResetState over its one concatenated program (docs/reference/cheats.md, "One program per pass"), which
+// cheat_anchor.py's pointer chains rely on when they zero register 15 behind themselves. Each cheat is still its own
+// program (vm_run): the conditional depth starts at 0 and the loop tops are reset for each (they index the cheat's own
+// words), so an unclosed block cannot swallow the next cheat and a stray loop end stays inside its own cheat. The
+// static registers stay. The lock is never waited for: a pass that arrives while a menu operation or another pass runs is
+// simply skipped (the next frame / tick applies again). The master switch stops everything; safe mode holds the masters
+// back too; a "set" cheat turns itself off after its pass
 static void cheats_pass(void) {
     if (!atomic_load(&g_active) || !atomic_load(&g_master)) return;
     if (pthread_mutex_trylock(&g_lock)) return;
     if (!atomic_load(&g_master)) { pthread_mutex_unlock(&g_lock); return; }   // switched off while this pass waited for the lock
     int fired = 0;
+    memset(g_reg, 0, sizeof g_reg);   // the reference's once-per-pass ResetState (the loop tops: per cheat, in vm_run)
     for (int half = 0; half < 2; half++) for (int i = 0; i < g_ncheat; i++) {
         cheat_t *c = &g_cheat[i];
-        if (c->broken || c->dead || c->label) continue;
-        if ((half == 0) != (c->master != 0)) continue;   // half 0 = masters, half 1 = the enabled plain cheats
-        if (half == 0 && g_safe) continue;               // safe mode: the masters wait for the player too
-        if (half && !c->on) continue;
-        if (c->nd) { nd_step(c); continue; }
-        memset(g_reg, 0, sizeof g_reg); memset(g_looptop, 0, sizeof g_looptop);   // the reference's per-pass register reset
-        vm_run(c);
+        if (!pass_runs(c, half)) continue;
+        c->pass_fail = 0;
+        if (c->nd) nd_step(c); else vm_run(c);
+        note_settle(c);
         if ((c->once || c->restore_once) && half) { c->on = 0; c->restore_once = 0; fired = 1; }
     }
-    if (fired) states_save();
+    if (fired) states_save();   // the file writes themselves leave on the files queue: the presenting thread never waits for the disk
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -758,10 +935,25 @@ static void cheat_key(const cheat_t *c, char *out, size_t n) {
 // The folder's flag files carry this game's title ID: one cheats folder may serve several games (an SD card's tree)
 static void flag_file(char *out, size_t n, const char *what) { snprintf(out, n, "%s/.cheats-%s-%s", g_dir, what, g_tid); }
 
+// The state files (<build>.enabled, the safe-mode flag) are written from one serial dispatch queue, never on the thread
+// that asked: a "set" cheat fires inside a pass on the presenting thread (hle_nvn.c dump_frame), where an fopen on the
+// cheats folder (a slow or external volume) would hold the frame. What to write is captured under g_lock by the caller
+// and handed to the queue, which writes in the order it was asked, so the files end as a synchronous write would have
+// left them. files_drain waits for everything queued: before the engine reads <build>.enabled back (states_load) and at
+// a clean exit, so nothing is lost or read stale. The queue's blocks take no lock of this file: a drain under g_lock
+// cannot deadlock
+static dispatch_queue_t files_queue(void) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("nxnative.cheats.files", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
+static void files_drain(void) { dispatch_sync(files_queue(), ^{}); }
+
 // The safe-mode flag: <dir>/.cheats-running-<title> exists while some cheat runs (a plain cheat on, or the masters while
 // not in safe mode, with the master switch on); a clean exit removes it (dm_cheats_exit), a crash leaves it for the next
 // launch. Not on iOS: an iOS app usually ends killed (swiped away, or while suspended), and the app has no cheats panel
-// to leave safe mode with
+// to leave safe mode with. The verdict is taken here, under g_lock; the file itself is written by the files queue, where
+// it checks g_exiting again: a flag queued just before a clean exit must not come back after the exit removed it
 static void running_update(void) {
 #if TARGET_OS_IPHONE
     return;
@@ -774,26 +966,45 @@ static void running_update(void) {
         any = c->master ? !g_safe : c->on;
     }
     char p[1100]; flag_file(p, sizeof p, "running");
-    if (any && atomic_load(&g_master)) {
-        FILE *f = fopen(p, "w");
-        if (f) { fprintf(f, "%s\n", g_build); fclose(f); }
-    } else unlink(p);
+    int want = any && atomic_load(&g_master);
+    char *path = strdup(p), *build = strdup(g_build);
+    if (!path || !build) { free(path); free(build); return; }
+    dispatch_async(files_queue(), ^{
+        if (!atomic_load(&g_exiting)) {
+            if (want) { FILE *f = fopen(path, "w"); if (f) { fprintf(f, "%s\n", build); fclose(f); } }
+            else unlink(path);
+        }
+        free(path); free(build);
+    });
 }
 
 // Save the enabled states: one key per line, <build>.enabled in the cheats folder (masters are always on, labels never
 // run, and a "set" cheat or a pending restore runs one pass only, so none of them is saved). Rewritten on every menu
-// toggle, read at each load; the safe-mode flag follows the states
+// toggle and when a one-pass cheat fired, read at each load; the safe-mode flag follows the states. The content is
+// built here under g_lock and written by the files queue
 static void states_save(void) {
     if (!g_dir[0] || !g_build[0]) return;
-    char path[1400]; snprintf(path, sizeof path, "%s/%s.enabled", g_dir, g_build);
-    FILE *f = fopen(path, "w");
-    if (!f) { LOG("cheats: cannot write %s (errno %d)", path, errno); return; }
+    char p[1400]; snprintf(p, sizeof p, "%s/%s.enabled", g_dir, g_build);
+    size_t cap = (size_t)g_ncheat * (NAME_MAX + 16) + 1, o = 0;   // every key with its newline fits
+    char *text = malloc(cap), *path = strdup(p);
+    if (!text || !path) { free(text); free(path); return; }
+    text[0] = 0;
     for (int i = 0; i < g_ncheat; i++) {
         const cheat_t *c = &g_cheat[i];
         if (!c->on || c->master || c->label || c->once || c->restore_once) continue;   // one-pass cheats are never saved as on
-        char k[NAME_MAX + 16]; cheat_key(c, k, sizeof k); fprintf(f, "%s\n", k);
+        char k[NAME_MAX + 16]; cheat_key(c, k, sizeof k);
+        o += (size_t)snprintf(text + o, cap - o, "%s\n", k);
     }
-    fclose(f);
+    dispatch_async(files_queue(), ^{
+        // Written to a temporary beside it and renamed over the old file: fopen("w") truncates first, so an exit (or a
+        // crash) in the middle would leave the saved toggles empty; the rename is atomic, the old file stays until then
+        char tmp[1500]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        FILE *f = fopen(tmp, "w");
+        if (!f) LOG("cheats: cannot write %s (errno %d)", tmp, errno);
+        else if (fputs(text, f) < 0 || fclose(f)) { LOG("cheats: cannot write %s (errno %d)", tmp, errno); unlink(tmp); }
+        else if (rename(tmp, path)) { LOG("cheats: cannot rename %s over %s (errno %d)", tmp, path, errno); unlink(tmp); }
+        free(text); free(path);
+    });
     running_update();
 }
 
@@ -860,6 +1071,7 @@ static void newest_other_enabled(char *out, size_t n) {
 // writes a master or a label. In safe mode the saved states wait for dm_cheats_safe_restore
 static void states_load(void) {
     g_carried[0] = 0;
+    files_drain();   // a save still on the files queue (a toggle, a "set" cheat that just fired) lands before it is read back
     if (g_dir[0] && !g_safe) {
         char path[1400]; snprintf(path, sizeof path, "%s/%s.enabled", g_dir, g_build);
         if (states_read(path) < 0 && g_have_meta) {
@@ -1109,36 +1321,44 @@ static void parse_file(const char *path) {
             if (!*p) continue;
         }
         if (!cur) continue;   // words before any [Name] / {Name} header belong to nothing: the line is ignored (site files carry prose)
-        // the words of the line: whole tokens of exactly 8 hex digits; anything else makes the line prose
-        int ngot = 0, bad = 0;
+        // The words of the line. dmnt accumulates hex digits and cuts a word every 8, whitespace only separating
+        // (docs/reference/cheats.md, "The file"), so a token of hex digits whose length is a multiple of 8 is that many
+        // words, glued ("0400000000123456"). A token of hex digits of any other length is not code on a Switch either
+        // (the file fails there) and here makes the line malformed: a 7-digit word is a typo, never prose. A token with
+        // a non-hex character is prose: alone it makes the line one to ignore, beside words it makes the line malformed.
+        // Every token is classified before the verdict, so a word after a prose token still counts as a word
+        int ngot = 0, prose = 0, oddhex = 0;
         const char *badt = "";   // the token that is not a word, named on the [RED] line
         for (char *s2 = NULL, *t = strtok_r(p, " \t\r", &s2); t; t = strtok_r(NULL, " \t\r", &s2)) {
-            if (strlen(t) != 8) { bad = 1; badt = t; break; }
-            uint32_t w = 0;
-            for (int k = 0; k < 8; k++) {
-                char a = (char)tolower((unsigned char)t[k]);
-                unsigned d = a >= '0' && a <= '9' ? (unsigned)(a - '0') : a >= 'a' && a <= 'f' ? (unsigned)(a - 'a' + 10) : 16;
-                if (d == 16) { bad = 1; badt = t; break; }
-                w = w << 4 | d;
+            size_t L = strlen(t), h = 0;
+            while (h < L && isxdigit((unsigned char)t[h])) h++;
+            if (h < L) { prose = 1; if (!badt[0]) badt = t; continue; }
+            if (L % 8) { oddhex = 1; badt = t; continue; }
+            for (size_t k = 0; k < L; k += 8) {
+                uint32_t w = 0;
+                for (size_t j = k; j < k + 8; j++) {
+                    char a = (char)tolower((unsigned char)t[j]);
+                    w = w << 4 | (a >= '0' && a <= '9' ? (unsigned)(a - '0') : (unsigned)(a - 'a' + 10));
+                }
+                if (ngot < INS_MAX) got[ngot++] = w;
+                else { LOG("[RED] cheat \"%s\": line %d has more than %d code words, the rest of the line is ignored", cur->name, ln, INS_MAX); break; }
             }
-            if (bad) break;
-            if (ngot < INS_MAX) got[ngot++] = w;
-            else { LOG("[RED] cheat \"%s\": line %d has more than %d code words, the rest of the line is ignored", cur->name, ln, INS_MAX); break; }
         }
-        if (!ngot && !bad) continue;   // only whitespace
-        if (bad && !ngot) {   // the file format ignores the line (the brief's "other lines"): prose, once warned
+        if (!ngot && !prose && !oddhex) continue;   // only whitespace
+        if (prose && !ngot && !oddhex) {   // the file format ignores the line (the brief's "other lines"): prose, once warned
             if (!g_junk++) g_junk_line = ln;
             if (!cur->junk_line) cur->junk_line = ln;
             if (!warned++) LOG("[RED] cheats: %s line %d is not code words and is ignored", path, ln);
             continue;
         }
-        if (bad) {
-            // words would be dropped from a line that held them: the dropped token may carry an instruction of its
-            // own (a vanished begin or end leaves the body running every frame unconditionally), so the cheat stays
-            // off entirely instead of silently running a fragment of itself; once per cheat, with the token named
+        if (prose || oddhex) {
+            // words would be dropped from a line that held them (or a hex token is not whole words): the dropped token
+            // may carry an instruction of its own (a vanished begin or end leaves the body running every frame
+            // unconditionally), so the cheat stays off entirely instead of silently running a fragment of itself; once
+            // per cheat, with the token named
             if (!cur->broken) {
                 cur->broken = 1; snprintf(cur->why, sizeof cur->why, " (malformed line %d)", ln);
-                LOG("[RED] cheats: %s: \"%s\" line %d mixes code words with \"%s\", the cheat stays off", path, cur->name, ln, badt);
+                LOG("[RED] cheats: %s: \"%s\" line %d %s \"%s\", the cheat stays off", path, cur->name, ln, oddhex ? "holds hex digits that are not whole words:" : "mixes code words with", badt);
             }
             continue;
         }
@@ -1393,10 +1613,13 @@ static void load_all(void) {
     for (int i = 0; i < nd; i++) collect_dir(dirs[i]);
     if (!g_build[0]) { LOG("[RED] cheats: the main NSO has no build ID, so no file can be picked from %s", g_dir); return; }
     int pick = -1, other = 0;   // pick = the matching candidate; other = when a non-matching one is used by DM_CHEATS_ANY_BUILD
+    int nbuild = 0, lone = -1;  // the candidates named after a build ID, and the last of them: DM_CHEATS_ANY_BUILD takes the
+                                // single such file, never a readme.txt that collect_dir listed beside it
     for (int i = 0; i < g_ncand; i++) {   // the whole list is walked: the build's file may lie after an "another version" one
         const char *nm = strrchr(g_cand[i], '/') + 1;
         int hex = name_hex16(nm);
         if (!hex) continue;
+        nbuild++; lone = i;
         if (name_is_build(nm, g_build)) {
             if (pick < 0) pick = i;   // the first matching candidate wins (the flat folder, then the Atmosphere tree)
             continue;   // keep walking: the other builds get collected below either way
@@ -1411,7 +1634,7 @@ static void load_all(void) {
             g_nothers++;
         }
     }
-    if (pick < 0 && !(g_any && g_ncand == 1)) {
+    if (pick < 0 && !(g_any && nbuild == 1)) {
         LOG("cheats: %s: no file for build %s", g_dir, g_build);
         if (g_nothers && atomic_load(&g_dbg)) {   // the menu's "another version" rows, this file's context
             char list[OTHER_MAX * 18]; list[0] = 0;
@@ -1419,9 +1642,10 @@ static void load_all(void) {
             LOG("cheats: %s: %d .txt of other builds in the folder:%s", g_dir, g_nothers, list);
         }
         report_build();
+        running_update();   // no cheat runs now: a reload that lost its file must not leave the safe-mode flag behind
         return;
     }
-    if (pick < 0) { pick = 0; other = 1; }   // DM_CHEATS_ANY_BUILD and a single non-matching file: load it
+    if (pick < 0) { pick = lone; other = 1; }   // DM_CHEATS_ANY_BUILD and a single file of another build: load it
     g_nothers = 0;   // a file is loaded (this build's own, or DM_CHEATS_ANY_BUILD's): no "another version" rows
     snprintf(g_path, sizeof g_path, "%s", g_cand[pick]);
     // The writable alias of main is mapped once a cheat file is actually picked, not at init merely because DM_ROOT is
@@ -1512,16 +1736,17 @@ void dm_cheats_init(void) {
 void dm_cheats_exit(void) {
     atomic_store(&g_exiting, 1);   // a pass still running on another thread must not write the flag back
     if (!g_dir[0]) return;
+    files_drain();                 // a queued <build>.enabled lands before the process ends; a queued flag sees g_exiting
     char p[1100]; flag_file(p, sizeof p, "running");
     unlink(p);
 }
 
 // ---------- the Mac cheats menu and panel (callers: front_mac.m; nothing else uses these) ----------
 // Cheap accessors read straight from the shared state: the list itself is rebuilt only from the main thread (this
-// menu's own actions, and init on the Mac's main thread), and a VM pass mutates only its own cheat's dead / why flags,
-// the on / restore_once flags of a one-pass cheat, the never-decrease state, and the files <build>.enabled and the safe-mode
-// flag when a one-pass cheat fired; the worst-case tear shows as one stale row in a row rebuilt in that instant. Each
-// accessor's meaning is in dm.h
+// menu's own actions, and init on the Mac's main thread), and a VM pass mutates only its own cheat's dead / why / fails /
+// noted fields, the on / restore_once flags of a one-pass cheat, the never-decrease state, and (through the files queue)
+// <build>.enabled and the safe-mode flag when a one-pass cheat fired; the worst-case tear shows as one stale row in a
+// row rebuilt in that instant. Each accessor's meaning is in dm.h
 
 int dm_cheats_found(void) { return atomic_load(&g_active) || g_ncheat > 0; }   // a file, of this build or another
 
@@ -1584,6 +1809,7 @@ void dm_cheat_toggle(int i) {
         c->on = (uint8_t)now;
         c->restore_once = 0;   // the player's own choice: a pending one-pass restore no longer applies
         if (now) c->nd_have = 0;
+        if (c->noted) { c->noted = 0; c->why[0] = 0; }   // the failed-access note describes passes before this choice; its next pass renews it if it must
         if (c->pair >= 0) {
             cheat_t *p = &g_cheat[c->pair];
             if (!c->pair_off) { if (!p->broken && !p->dead) { p->on = (uint8_t)!now; p->restore_once = (uint8_t)!now; } }
@@ -1602,7 +1828,10 @@ void dm_cheats_reload(void) {
 }
 
 // The dry run: what cheat i would write right now, one line per write ("main+0x… (2 bytes): 37 -> 999"), nothing written
-// and nothing turned off (static registers and never-decrease state are left as they were). Returns the number of writes
+// and nothing turned off (static registers, never-decrease state and the failure counts are left as they were). The
+// cheats a pass runs before it (the masters, the enabled plain cheats earlier in the file) are replayed first with their
+// description switched off, so the registers hold what a real pass leaves in them when its turn comes (cheats_pass
+// shares them). Returns the number of writes
 int dm_cheat_preview(int i, char *out, size_t cap) {
     if (!out || !cap) return 0;
     out[0] = 0;
@@ -1625,8 +1854,17 @@ int dm_cheat_preview(int i, char *out, size_t cap) {
     } else {
         static uint64_t keep[256];
         memcpy(keep, g_static, sizeof keep);
-        memset(g_reg, 0, sizeof g_reg); memset(g_looptop, 0, sizeof g_looptop);
-        g_dry = 1; vm_run(c); g_dry = 0;
+        memset(g_reg, 0, sizeof g_reg);   // the loop tops are reset per cheat by vm_run
+        g_dry = 1;
+        g_dry_out = NULL;   // the predecessors' run describes nothing (dry_line returns at once) and writes nothing
+        for (int half = 0, stop = 0; half < 2 && !stop; half++) for (int j = 0; j < g_ncheat && !stop; j++) {
+            cheat_t *o = &g_cheat[j];
+            if (o == c && (half == 0) == (c->master != 0)) { stop = 1; break; }   // its own turn: the replay ends here
+            if (pass_runs(o, half) && !o->nd) vm_run(o);                          // never-decrease keeps its own state: not replayed
+        }
+        g_dry_out = out; g_dry_len = 0; g_dry_writes = 0;
+        vm_run(c);
+        g_dry = 0;
         memcpy(g_static, keep, sizeof keep);
         if (!g_dry_writes && !g_dry_len) dry_line("writes nothing right now (a condition is not met, or a patch's code is not the original any more)");
     }
