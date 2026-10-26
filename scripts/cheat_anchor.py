@@ -41,6 +41,7 @@ BASES_TRIED = 6                      # nearest referenced addresses (and pointer
 ATMOSPHERE_WORDS = 0x100             # code words Atmosphère's dmnt accepts per cheat (its program of all enabled cheats: 0x400)
 REGION_BITS = 40                     # a region-relative address of opcodes 0 / 1 / 5 has 40 bits
 R_AARCH64_RELATIVE = 1027
+DATA_KINDS = ('ro', 'data', 'bss')   # Build.where's segments that hold data: the ones a data anchor may describe
 TODAY = datetime.date.today().isoformat()
 
 
@@ -99,6 +100,54 @@ def mask_word(w):
     return w
 
 
+# Encodings that cannot hold an address or a PC-relative offset: (mask, value) per ARMv8 encoding class. Anything not
+# listed carries address bits as far as this tool knows (B / BL / B.cond / CBZ / TBZ, ADR / ADRP, literal loads, loads
+# and stores with an immediate offset, ADD / SUB immediate, unknown words). The list only widens what may be written
+# over a relocated instruction, so it holds only forms whose every field is a register, a condition or a constant.
+NO_ADDRESS_FORMS = (
+    (0xfffff01f, 0xd503201f),   # HINT (NOP, YIELD, WFE, BTI, ...): System, CRn = 0010, Rt = 11111
+    (0x1f800000, 0x12800000),   # Move wide (immediate): MOVN / MOVZ / MOVK (opc 01 is unallocated: carries_address_bits)
+    (0x1f000000, 0x0a000000),   # Logical (shifted register): AND, BIC, ORR (MOV register), ORN (MVN), EOR, EON, ANDS, BICS
+    (0x1f000000, 0x0b000000),   # Add/subtract (shifted and extended register): ADD, ADDS (CMN), SUB (NEG), SUBS (CMP)
+    (0x1fe00000, 0x1a000000),   # Add/subtract (with carry): ADC, ADCS, SBC (NGC), SBCS
+    (0x1fe00000, 0x1a800000),   # Conditional select: CSEL, CSINC (CSET), CSINV, CSNEG
+    (0x5fe00000, 0x1ac00000),   # Data-processing (2 source): UDIV, SDIV, LSLV, LSRV, ASRV, RORV
+    (0x5fe00000, 0x5ac00000),   # Data-processing (1 source): RBIT, REV, CLZ, CLS
+    (0x1f000000, 0x1b000000),   # Data-processing (3 source): MADD (MUL), MSUB (MNEG), SMADDL, UMULH, ...
+    (0xfffffc1f, 0xd65f0000),   # RET (Unconditional branch, register): the target is a register
+    (0xff3ffc00, 0x1e204000),   # FMOV (register): Floating-point data-processing (1 source), opcode 000000
+    (0xff201fe0, 0x1e201000),   # FMOV (scalar, immediate): Floating-point immediate, imm5 = 00000
+)
+
+
+def carries_address_bits(w):
+    """False only when w is one of NO_ADDRESS_FORMS: a word that means the same at any address, so a cheat may write it
+    over an instruction that moved with its function (NOP a moved BL, a MOV over a moved adrp's user). True for every
+    other word, unknown ones included: there a word of the old build would keep the old build's address bits."""
+    if w & 0x1f800000 == 0x12800000 and (w >> 29) & 3 == 1: return True   # opc 01 of move wide: unallocated, not a MOV
+    return not any(w & m == v for m, v in NO_ADDRESS_FORMS)
+
+
+def is_conditional_branch(w):
+    """True for B.cond, CBZ / CBNZ and TBZ / TBNZ: the PC-relative branches a cheat flips without re-encoding."""
+    return w & 0xff000010 == 0x54000000 or w & 0x7e000000 in (0x34000000, 0x36000000)
+
+
+def carry_write(authored, here, new, a, width):
+    """The value (width bytes) a store at a writes on this build, or None when it must be refused. authored and here
+    are the aligned words that hold a on the authored build and on this one. Equal words: new as written. Different
+    words mean the instruction moved (a branch, an adrp, the low page bits after one), so new was meant for the old
+    address: a restore of the authored bytes writes this build's own bytes instead, and any other value is kept only
+    when the word it makes here is the word it made on the authored build (the bytes it leaves are equal) and that
+    word carries no address bits. The one rule patches and code templates share."""
+    if authored == here: return new
+    sh, mask = 8 * (a & 3), (1 << 8 * width) - 1
+    if new == (authored >> sh) & mask: return (here >> sh) & mask   # the restore: this build's own bytes
+    made_here = here & ~(mask << sh) | new << sh
+    made_there = authored & ~(mask << sh) | new << sh
+    return new if made_here == made_there and not carries_address_bits(made_here) else None
+
+
 def adrp_user_lo(u, rd):
     """The low page offset an add (64-bit immediate) or a ldr / str (unsigned offset) with base register rd adds to an
     adrp's page, or None when u is not such an instruction (the pairing rule of nso_match and nso_fnmap)."""
@@ -133,8 +182,11 @@ class Build:
         except OSError as e: raise AnchorError(f'{self.path.resolve()}: {e.strerror}') from e
         if hdr[:4] != b'NSO0': raise AnchorError(f'{self.path.resolve()}: not an NSO file')
         self.img = bytes(load_nso(str(self.path)))   # the whole memory image, text at 0, bss included
-        segs = [struct.unpack_from('<III', hdr, 0x10 + i * 0x10) for i in range(3)]
+        segs = [struct.unpack_from('<III', hdr, 0x10 + i * 0x10) for i in range(3)]   # file offset, memory offset, size
         self.text_end, self.ro_start = segs[0][2], segs[1][1]
+        # .data from its memory offset; .bss right after it up to the image's end (nso_syms.load sizes the image to
+        # data offset + data size + the bss size at 0x3C). where() keeps a data anchor inside its target's segment
+        self.data_start, self.bss_start = segs[2][1], segs[2][1] + segs[2][2]
         self.build_id = hdr[0x40:0x48].hex().upper()   # the first 8 bytes, as cheat files are named
         nacp_path = self.path.parent.parent / 'control.nacp'   # nx_extract writes it beside ExeFS
         self.version = nacp.version(nacp_path) if nacp_path.is_file() else ''
@@ -287,11 +339,13 @@ class Build:
         return self._ptrs.get(ptr, [])
 
     def _below(self, keys, target):
-        """The nearest BASES_TRIED values of the sorted keys at or below target, within MAX_FIELD of it."""
-        i, out = bisect.bisect_right(keys, target), []
+        """The nearest BASES_TRIED values of the sorted keys at or below target, within MAX_FIELD of it and in its
+        segment. A base in another segment is never an object the target is a field of, and segments move apart
+        across builds (a grown .rodata shifts .data), so such a base would resolve to a wrong address."""
+        seg, i, out = self.where(target), bisect.bisect_right(keys, target), []
         while i > 0 and len(out) < BASES_TRIED:
             i -= 1
-            if target - keys[i] > MAX_FIELD: break
+            if target - keys[i] > MAX_FIELD or self.where(keys[i]) != seg: break   # segments are contiguous: all lower keys are out too
             out.append(keys[i])
         return out
 
@@ -306,11 +360,12 @@ class Build:
         return self._below(self._ptr_keys, target)
 
     def where(self, off, n=1):
-        """'text', 'pad' (the zero padding after the text), 'data' or None for [off, off + n) of the image."""
+        """The segment of [off, off + n) of the image: 'text', 'pad' (the zero padding after the text), 'ro' (.rodata, up
+        to .data), 'data', 'bss' (DATA_KINDS are the last three), or None outside the image or across a boundary."""
         if off < 0 or off + n > len(self.img): return None
-        if off + n <= self.text_end: return 'text'
-        if off >= self.text_end and off + n <= self.ro_start: return 'pad'
-        if off >= self.ro_start: return 'data'
+        for kind, lo, hi in (('text', 0, self.text_end), ('pad', self.text_end, self.ro_start), ('ro', self.ro_start, self.data_start),
+                             ('data', self.data_start, self.bss_start), ('bss', self.bss_start, len(self.img))):
+            if lo <= off and off + n <= hi: return kind
         return None
 
 
@@ -415,24 +470,54 @@ class Authoring:
 
 # ---------- Atmosphère text and its instructions ----------
 
-TOKEN = re.compile(r'\[([^\]\n]*)\]|\{([^}\n]*)\}|([0-9A-Fa-f]{8})(?![0-9A-Fa-f])|(\S+)')
+# A header, a master header, a run of whole 8-digit words (Atmosphère reads 8 digits at a time, so "0400000000123456" is
+# two words), or any other token; the last stops before a bracket so that "junk[Next]" still starts the next cheat.
+TOKEN = re.compile(r'\[([^\]\n]*)\]|\{([^}\n]*)\}|((?:[0-9A-Fa-f]{8})+)(?![0-9A-Fa-f])|([^\s\[{]+|\S)')
 
 
 def parse_atmosphere(text):
-    """[(name, master, [words]), ...] and [warnings] of an Atmosphère cheat file. Lenient like the host's loader: prose
-    before the first header is ignored; a header glued to the previous code word ("00000008[Next]") still starts a new
-    cheat; a stray token inside a cheat is reported and skipped."""
+    """[(name, master, [words], [(word index, line, token)]), ...] and [warnings] of an Atmosphère cheat file. Lenient
+    like the host's loader where nothing is lost: prose before the first header is ignored; a header glued to the
+    previous code word ("00000008[Next]") still starts a new cheat; words glued together are split; a line with no code
+    word at all is prose (a credits or author line) and is ignored with a warning, as the host's loader ignores it. A
+    token of hex digits only counts as a (botched) code word: "2000000" alone on a line is a cut end-of-block, not prose.
+    A stray token on a line that also holds code words makes the cheat malformed: it is listed with its line and the
+    place it stood, never dropped, because a shortened program can change meaning (a lost end-of-block word lets an
+    open conditional swallow the next cheats)."""
     entries, warns, cur = [], [], None
+    pending, has_word, cur_line = [], False, 0   # the stray tokens of the current line, and whether it holds a code word
+
+    def flush():
+        """Settle the current line's stray tokens: malformed when the line holds code words, prose otherwise."""
+        for entry, index, ln, tok in pending:
+            if has_word: entry[3].append((index, ln, tok))
+            else: warns.append(f'line {ln}: "{tok}" in "{entry[0]}" is not a code word, ignored (no code word on the line)')
+        pending.clear()
     for m in TOKEN.finditer(text):
         line = text.count('\n', 0, m.start()) + 1
+        if line != cur_line: flush(); cur_line, has_word = line, False
         if m.group(1) is not None or m.group(2) is not None:
-            cur = [(m.group(1) if m.group(1) is not None else m.group(2)).strip(), m.group(2) is not None, []]
+            flush(); has_word = False   # tokens before a header glued on the same line belong to the previous cheat
+            cur = [(m.group(1) if m.group(1) is not None else m.group(2)).strip(), m.group(2) is not None, [], []]
             entries.append(cur)
         elif m.group(3):
             if cur is None: warns.append(f'line {line}: code word before any [name], ignored')
-            else: cur[2].append(int(m.group(3), 16))
-        elif cur is not None and cur[2]: warns.append(f'line {line}: "{m.group(4)}" in "{cur[0]}" is not a code word, ignored')
+            else: cur[2] += [int(m.group(3)[k:k + 8], 16) for k in range(0, len(m.group(3)), 8)]; has_word = True
+        elif cur is not None:
+            pending.append((cur, len(cur[2]), line, m.group(4)))
+            if re.fullmatch(r'[0-9A-Fa-f]+', m.group(4)): has_word = True   # a code word of the wrong length
+    flush()
     return [tuple(e) for e in entries], warns
+
+
+def malformed_code(words, bad):
+    """A malformed cheat's program for the source: its words with each stray token back where it stood, four per line.
+    The compiler refuses the stray token ("not a code word"), so the cheat is never run shortened."""
+    toks = []
+    for i in range(len(words) + 1):
+        toks += [t for j, _, t in bad if j == i]
+        if i < len(words): toks.append(f'{words[i]:08X}')
+    return ''.join(' '.join(toks[k:k + 4]) + '\n' for k in range(0, len(toks), 4))
 
 
 def decode(words, i):
@@ -533,7 +618,8 @@ def import_file(txt, build, assume_build=False):
     entries, warns = parse_atmosphere(text)
     report = [f'warning: {w}' for w in warns]
     stem, own_build = Path(txt).name[:16], build.build_id
-    if re.fullmatch(r'[0-9A-Fa-f]{16}', stem) and stem.upper() != build.build_id:
+    # a file named after the title ID (as some sites name them) names no build: it is taken as this build's
+    if re.fullmatch(r'[0-9A-Fa-f]{16}', stem) and stem.upper() not in (build.build_id, build.title):
         if not assume_build:
             raise AnchorError(f'{Path(txt).name} names build {stem.upper()}, the NSO is build {build.build_id}; '
                               '--assume-build anchors it on this build anyway (only if both builds share the layout)')
@@ -541,7 +627,12 @@ def import_file(txt, build, assume_build=False):
         report.append(f'[RED] {Path(txt).name} is for build {own_build}: anchored with the code of build {build.build_id} (--assume-build)')
     auth = Authoring(build)
     decoded = []
-    for name, master, words in entries:   # first pass: decode everything, to place the cave before any anchor names it
+    malformed = {}   # entry index -> the stray tokens of a malformed cheat (parse_atmosphere)
+    for name, master, words, bad in entries:   # first pass: decode everything, to place the cave before any anchor names it
+        if bad:
+            malformed[len(decoded)] = bad
+            decoded.append((name, master, words, None, 'malformed: ' + ', '.join(f'line {ln}: "{t}" is not a code word' for _, ln, t in bad)))
+            continue
         try: decoded.append((name, master, words, decode_all(words), None))
         except AnchorError as e: decoded.append((name, master, words, None, str(e)))
     pad = []   # every padding address the file touches: addresses, and B / BL targets of the words it writes
@@ -555,15 +646,16 @@ def import_file(txt, build, assume_build=False):
                     if t is not None and build.where(t, 4) == 'pad': pad.append(t)
     if pad: auth.set_cave(min(pad))
     cheats, bound = [], 0
-    for name, master, words, ins, err in decoded:
+    for n, (name, master, words, ins, err) in enumerate(decoded):
         c = {'name': name}
         if master: c['master'] = True
-        if not words: c['label'] = True; cheats.append(c); continue
+        if not words and n not in malformed: c['label'] = True; cheats.append(c); continue
         try:
             if err: raise AnchorError(err)
             c.update(convert(auth, words, ins))
         except AnchorError as e:
-            c['code'] = format_words(words, ins); c['builds'] = [own_build]; bound += 1
+            c['code'] = malformed_code(words, malformed[n]) if n in malformed else format_words(words, ins)
+            c['builds'] = [own_build]; bound += 1
             report.append(f'[RED] "{name}": kept for build {own_build} only: {e}')
         cheats.append(c)
     # evidence the file is for this build: writes into the code (not the zero cave) of the words already there, as the
@@ -607,17 +699,35 @@ def convert(auth, words, ins):
             start, end = (run_of(rel, n) if store else None) or (rel & ~3, (rel + n + 3) & ~3)
             return auth.site(start, end - start) + (f'+{hexu(rel - start)}' if rel != start else '')
         if kind == 'pad': return auth.cave(rel)
-        if kind == 'data': return auth.data(rel)
+        if kind in DATA_KINDS: return auth.data(rel)
         raise AnchorError(f'address {hexu(rel)} is outside the main NSO image or crosses a segment')
 
+    def keeps(w, a, t):
+        """True when the PC-relative word w at a, aimed at t, stays right as written: t in the run w is written in, or
+        a conditional branch inside the site's own function (same_function_branch)."""
+        return any(s <= a < e and s <= t < e for s, e in own) or same_function_branch(b, w, a, t)
+
     def value_tokens(d):
-        """The stored memory words; a B / BL to outside the run the word is written in becomes a relocatable token."""
+        """The stored memory words; a B / BL to outside the run the word is written in becomes a relocatable token.
+        Every word a store makes, a 1- or 2-byte store's whole word included, must be carried as written: a
+        PC-relative word only when keeps() holds, and never a new adrp user (adrp_paired: its low page bits are this
+        build's, and the data can move inside its page while the code does not)."""
         out = []
         for k, w in enumerate(mem_words(d['width'], d['value'])):
             a = d['rel'] + 4 * k
-            if d['width'] < 4: out.append(f'{w:0{2 * d["width"]}X}'); continue
+            a4, here = a & ~3, b.word(a & ~3)
+            sh, mask = 8 * (a & 3), (1 << 8 * min(d['width'], 4)) - 1
+            made = here & ~(mask << sh) | w << sh   # the whole word this store leaves in memory
+            if made != here and b.where(a4, 4) == 'text' and adrp_paired(b.word, a4, made) is not None:
+                raise AnchorError(f'the word {made:08X} written at {hexu(a4)} takes the page of the adrp at {hexu(adrp_paired(b.word, a4, made))}: '
+                                  'its low page bits hold for this build only')
+            if d['width'] < 4:
+                t = pc_relative_target(made, a4) if made != here else None
+                if t is not None and not keeps(made, a, t):
+                    raise AnchorError(f'the {d["width"]}-byte write at {hexu(a)} makes {made:08X}, PC-relative to {hexu(t)}, outside what the cheat writes')
+                out.append(f'{w:0{2 * d["width"]}X}'); continue
             t = pc_relative_target(w, a)
-            if t is None or any(s <= a < e and s <= t < e for s, e in own): out.append(f'{w:08X}'); continue
+            if t is None or keeps(w, a, t): out.append(f'{w:08X}'); continue
             if branch_target(w, a) is None: raise AnchorError(f'the word {w:08X} written at {hexu(a)} is PC-relative to {hexu(t)}, outside what the cheat writes')
             out.append(('bl:' if w & 0x80000000 else 'b:') + addr_expr(t, 4))
         return out
@@ -633,15 +743,20 @@ def convert(auth, words, ins):
                 item['same'] = True   # writes the word already there: a restore (pair_on_off and the import report use it)
             patch.append(item)
         return {'patch': patch}
-    if simple and len(stores) == 1 and b.where(stores[0]['rel'], stores[0]['width']) == 'data':
+    if simple and len(stores) == 1 and b.where(stores[0]['rel'], stores[0]['width']) in DATA_KINDS:
         d = stores[0]
         return {'target': addr_expr(d['rel'], d['width']), 'type': f'u{8 * d["width"]}', 'action': 'freeze', 'value': d['value']}
-    words, tokens = list(words), {}
+    words, tokens, written = list(words), {}, registers_written(words, ins)
     for i, d in ins:
         if 'rel' not in d: continue
         if d['mem'] != 0: raise AnchorError(f'an address in memory region {d["mem"]} (not the main NSO) cannot be anchored')
-        indexed = d['op'] == 0 and d['reg'] and regs   # a store at base + a register the cheat sets: only the base is anchored
-        if indexed and b.where(d['rel'], 1) != 'data': raise AnchorError(f'a store into code at {hexu(d["rel"])} indexed by register {d["reg"]}')
+        if d['op'] == 0xA and b.where(d['rel'], 1) in ('text', 'pad'):   # only opcode 0 literals pass value_tokens / carry_write
+            raise AnchorError(f'a store of a register into the code at {hexu(d["rel"])}: its value is not a word the compiler can check')
+        # a store at base + a register the cheat sets: only the base is anchored. The VM always adds the offset
+        # register, r0 included, so r0 counts once the cheat writes it; another register counts whenever the cheat
+        # changes any (all enabled cheats run as one program, so another cheat may have set it)
+        indexed = d['op'] == 0 and ((d['reg'] and regs) or (d['reg'] == 0 and 0 in written))
+        if indexed and b.where(d['rel'], 1) not in DATA_KINDS: raise AnchorError(f'a store into code at {hexu(d["rel"])} indexed by register {d["reg"]}')
         store = d['op'] == 0 and not indexed
         tokens[i + 1] = '{' + addr_expr(d['rel'], d['width'] if store else 1, store=store) + '}'
         words[i] &= ~(0xFF if d['bits'] == 40 else 0xF)   # the template keeps the address bits of the first word zero
@@ -651,11 +766,44 @@ def convert(auth, words, ins):
     return {'code': format_words(words, ins, tokens)}
 
 
+def adrp_paired(word_at, a, w):
+    """The offset of an adrp up to LOOKBACK words before text offset a whose page the word w written at a would use
+    (an add / ldr / str with the adrp's register as base, nothing between them writing that register or branching),
+    or None. Such a w holds the low 12 bits of a data address on the build it was written for; the data can move inside
+    its page while the code around it does not, so w is never carried as written. word_at(off) reads the build."""
+    for p in range(max(0, a - 4 * LOOKBACK), a, 4):
+        u = word_at(p)
+        if u & 0x9f000000 != 0x90000000 or adrp_user_lo(w, u & 31) is None: continue
+        if not any(ends_pairing(word_at(j), u & 31) for j in range(p + 4, a, 4)): return p
+    return None
+
+
+def registers_written(words, ins):
+    """The VM registers a program may write: the R field (bits 16-19) of opcodes 3 (loop counter), 4, 5, 7, 9 and of
+    6 / A (their incrementing forms), and every register for C1-C3 (save, restore, static registers)."""
+    out = set()
+    for i, d in ins:
+        if d['op'] in (3, 4, 5, 6, 7, 9, 0xA): out.add((words[i] >> 16) & 0xF)
+        elif d['op'] in (0xC1, 0xC2, 0xC3): out.update(range(16))
+    return out
+
+
+def same_function_branch(build, w, a, t):
+    """True when w, written at text offset a, is a conditional branch (B.cond, CBZ / CBNZ, TBZ / TBNZ: no token form)
+    whose target t lies in the unwind function that holds a, and that function has a fingerprint or a body digest.
+    A match by either implies the same layout, so the offset stays right wherever the function moves; compile writes
+    it only when the site's function was found that way, not by its window (Compiler._check_pc_relative)."""
+    if not is_conditional_branch(w): return False
+    f = build.func_at(a)
+    if f is None or not f <= t < build.mod.functions[f]: return False
+    return build.digest(f, 'fp') is not None or build.digest(f, 'body') is not None
+
+
 def pair_on_off(cheats):
     """Merge "<name> - on" / "<name> - off" patches into one patch cheat when the off entry puts back exactly the original
     words of the code sites the on entry changes (its cave writes need no restore). The merged cheat keeps both names
     (on_name / off_name) and their order (off_first), so the compiled file has the same two entries in the same order and
-    the saved toggles stay valid."""
+    the saved toggles stay valid, and each entry's master flag ({name}: always on): master, off_master."""
     by = {}
     for i, c in enumerate(cheats):
         m = ON_OFF.match(c['name'])
@@ -666,7 +814,10 @@ def pair_on_off(cheats):
         on, off = cheats[two['on']], cheats[two['off']]
         changed = {w['at'] for w in on['patch'] if not w['at'].startswith('cave') and not w.get('same')}
         if not changed or {w['at'] for w in off['patch']} != changed or not all(w.get('same') for w in off['patch']): continue
-        merged = {'name': ON_OFF.match(on['name']).group(1).strip(), 'on_name': on['name'], 'off_name': off['name']}
+        m = ON_OFF.match(on['name']); assert m   # matched when `by` was built
+        merged = {'name': m.group(1).strip(), 'on_name': on['name'], 'off_name': off['name']}
+        if on.get('master'): merged['master'] = True
+        if off.get('master'): merged['off_master'] = True   # an optional key: the off entry keeps its own flag
         if two['off'] < two['on']: merged['off_first'] = True
         merged['patch'] = on['patch']
         first, second = sorted((two['on'], two['off']))
@@ -694,7 +845,9 @@ def toml_value(v, key=''):
     if isinstance(v, float): return repr(v)
     if isinstance(v, str):
         if '\n' in v and not re.search(r'[\x00-\x09\x0b-\x1f\x7f]', v):   # code: hex words, tokens and newlines only
-            return '"""\n' + v.replace('\\', '\\\\').replace('"""', '\\"""') + '"""'
+            # every quote escaped: escaping only '"""' leaves a run of four or more (or one before the closing
+            # delimiter) that TOML reads as the end of the string; a malformed cheat's stray token can hold any
+            return '"""\n' + v.replace('\\', '\\\\').replace('"', '\\"') + '"""'
         return toml_str(v)
     if isinstance(v, list):
         if v and all(isinstance(x, dict) for x in v): return '[\n' + ''.join(f'  {toml_value(x)},\n' for x in v) + ']'
@@ -787,7 +940,7 @@ class Resolver:
     def _check_words(self, loc, site, old):
         """The site must hold the authored original words: raw, or, when only relocation bits differ (an instruction that
         moved with its function: a branch, an adrp, the low page bits after one), the same masked words as the authored
-        window. A patch then refuses to overwrite such a relocated word with words of the old build (Compiler.patch)."""
+        window. What may then be written over such a relocated word is decided by carry_write (Compiler.site_word)."""
         b = self.b
         if site < 0 or site + 4 * len(old) > b.text_end: raise AnchorError(f'code site {hexu(site)} is outside the text')
         now = b.words(site, len(old))
@@ -799,8 +952,9 @@ class Resolver:
     def data(self, a):
         """A data anchor: each reference resolved alone (each site counted once) and decoded as an adrp pair; with deref,
         each slot it computes followed through its relative relocation. At least two results must agree (one when the
-        anchor has one reference) and none may disagree."""
-        got, seen, slots = {}, set(), set()
+        anchor has one reference) and none may disagree. A reference found among identical copies by order alone
+        counts for the address, but when fewer than that many strong references agree the anchor is marked weak."""
+        got, seen, slots, weak = {}, set(), set(), {}
         for loc in a['data']:
             try: site, tier = self.code(loc, verify=False)
             except AnchorError: continue
@@ -813,6 +967,7 @@ class Resolver:
                 if addr is None: continue   # a slot without a relative relocation: this reference counts as missing
                 slots.add(slot)
             got.setdefault(addr, []).append(tier.split(',')[0])
+            if 'weak' in tier: weak[addr] = weak.get(addr, 0) + 1   # "copy k of n by order: weak": kept apart from the tier
         n = len(a['data'])
         if not got: raise AnchorError(f'none of its {n} code references was found')
         if len(got) > 1: raise AnchorError('its code references disagree: ' + ', '.join(f'{hexu(k)} ({len(v)})' for k, v in got.items()))
@@ -820,6 +975,7 @@ class Resolver:
         if len(tiers) < min(2, n): raise AnchorError(f'only 1 of its {n} code references was found (need 2)')
         how = f'{len(tiers)}/{n} refs (' + ', '.join(f'{tiers.count(t)} {t}' for t in ('exact', 'body', 'window') if t in tiers) + ')'
         if n == 1: how += ', weak: one reference'
+        elif len(tiers) - weak.get(addr, 0) < 2: how += f', weak: {weak[addr]} of them identical copies by order'
         if slots: how += ' through the slot' + ('s ' if len(slots) > 1 else ' ') + ', '.join(hexu(s) for s in sorted(slots))
         return addr, how
 
@@ -865,7 +1021,8 @@ class Compiler:
 
     def addr(self, node, cheat):
         """(region, offset, how) of a static address node: region 0 main, 1 heap. A fixed main / heap address is valid
-        only when the cheat's builds name this build; a main address must lie in the image, a heap one in 40 bits."""
+        only when the cheat's builds name this build; a main address must lie in the image, a heap one in 40 bits; a
+        data anchor plus its field offset must stay in the anchor's segment."""
         kind, name, off = node
         if kind == 'deref': raise AnchorError('a pointer chain is not allowed here')
         if name in ('main', 'heap'):
@@ -875,39 +1032,75 @@ class Compiler:
         else:
             base, how = self.r.resolve(name)
             region, addr = 0, base + off
+            # a field never leaves its object's segment: an anchor in .rodata with an offset into .data (sources written
+            # before import kept bases in the target's segment) would land elsewhere once .rodata grows
+            if 'data' in self.src.get('anchors', {}).get(name, {}) and self.b.where(base) != self.b.where(addr):
+                raise AnchorError(f'{name}{"+" if off >= 0 else "-"}{hexu(abs(off))} crosses from {self.b.where(base)} into {self.b.where(addr)}: '
+                                  'a field offset never leaves its anchor\'s segment')
         if not (0 <= addr < (len(self.b.img) if region == 0 else 1 << REGION_BITS)):
             raise AnchorError(f'address {hexu(addr)} is outside the {"main NSO image" if region == 0 else "region"}')
         return region, addr, how
 
     def code_words(self, text, cheat):
         """The words of a code template: {EXPR} address tokens (the second word of an instruction with a region-relative
-        address, whose first word keeps the address bits zero) and {bl:EXPR} / {b:EXPR} value tokens of opcode 0 stores."""
+        address, whose first word keeps the address bits zero) and {bl:EXPR} / {b:EXPR} value tokens of opcode 0 stores.
+        A store into the code or the cave goes through site_word, the rules patches follow, whatever gates it. A program
+        the decoder cannot read has no tokens to fill: it is kept verbatim on the builds its cheat names, else refused."""
         words, special, how = [], {}, set()
         for t in re.findall(r'\{[^}]*\}|[0-9A-Fa-f]{8}|\S+', text):
             if t.startswith('{'): special[len(words)] = t[1:-1].strip(); words.append(0)
             elif re.fullmatch(r'[0-9A-Fa-f]{8}', t): words.append(int(t, 16))
             else: raise AnchorError(f'"{t}" is not a code word')
+        try: decode_all(words)
+        except AnchorError:
+            if special or self.b.build_id not in cheat.get('builds', []): raise
+            return words, {'fixed, kept verbatim (not decoded)'}
         i = 0
         while i < len(words):
-            d = decode(words, i)
+            d, node = decode(words, i), None
             if i + 1 in special and ':' not in special[i + 1]:
                 if 'bits' not in d: raise AnchorError(f'word {i + 1}: an address token where {words[i]:08X} has no address')
-                region, off, h = self.addr(parse_expr(special.pop(i + 1)), cheat); how.add(h)
+                node = parse_expr(special.pop(i + 1))
+                region, off, h = self.addr(node, cheat); how.add(h)
                 if region != d['mem']: raise AnchorError(f'word {i + 1}: the address is in another region than {words[i]:08X} names')
                 if not 0 <= off < 1 << d['bits']: raise AnchorError(f'word {i + 1}: address {hexu(off)} does not fit')
                 words[i] = (words[i] & ~(0xFF if d['bits'] == 40 else 0xF)) | (off >> 32); words[i + 1] = off & 0xffffffff
                 d = decode(words, i)
             if d['op'] == 0:
+                tokens = set()
                 for k in range(len(mem_words(d['width'], 0))):
                     j = value_index(i, d['width'], k)
                     if j in special and ':' in special[j]:
                         link, expr = special.pop(j).split(':', 1)
                         if link not in ('b', 'bl') or d['width'] < 4: raise AnchorError(f'word {j}: bad token "{link}:"')
                         region, target, h = self.addr(parse_expr(expr), cheat); how.add(h)
-                        words[j] = encode_branch(link == 'bl', d['rel'] + 4 * k, target)
+                        words[j] = encode_branch(link == 'bl', d['rel'] + 4 * k, target); tokens.add(j)
+                if node is not None and d['mem'] == 0: self._store_values(node, d, i, words, tokens)
+            if d['op'] == 1 and node is not None and d['mem'] == 0: self._compare_values(node, d, i, words)
             i += d['n']
         if special: raise AnchorError(f'word {min(special)}: a token where none can stand')
         return words, how
+
+    def _store_values(self, node, d, i, words, tokens):
+        """Apply site_word to the value words (in place) of the anchored opcode 0 store d at word i of a template, for
+        each of its 4-byte memory words that lies in the code or the cave; tokens are the indexes already re-encoded."""
+        for k in range(len(mem_words(d['width'], 0))):
+            a, width, j = d['rel'] + 4 * k, min(d['width'], 4), value_index(i, d['width'], k)
+            if self.b.where(a, width) in ('text', 'pad'): words[j] = self.site_word(node, a, width, words[j], j in tokens)
+
+    def _compare_values(self, node, d, i, words):
+        """Map the value words (in place) of the anchored opcode 1 compare d at word i the way a restore is mapped: a
+        4-byte memory word of the code compared with its authored original is compared with this build's word, so an
+        "if [X] == original" gate still opens where that instruction moved. Other values, and words outside the code
+        anchor's verified words, are left as written (a compare only gates; it writes nothing)."""
+        width = (words[i] >> 24) & 0xF
+        if width < 4: return
+        for k in range(width // 4):
+            a, j = d['rel'] + 4 * k, value_index(i, width, k)
+            if self.b.where(a, 4) != 'text': continue
+            try: authored = self._site_old(node, a, 4)
+            except AnchorError: continue   # beyond the anchored words: nothing recorded to map from
+            if words[j] == authored: words[j] = self.b.word(a)
 
     def value(self, cheat, v):
         """(width, the value as an unsigned integer) of a data cheat's value in its type."""
@@ -977,25 +1170,70 @@ class Compiler:
         return words + [0x20000000], how                                  # end of the "not 0" block
 
     def _site_old(self, node, a, width):
-        """The authored original bytes at a for a patch word into the code, from its code anchor's recorded words; None
-        for a fixed address (the cheat names its builds). Raises AnchorError when a is not inside those words."""
+        """The authored original aligned word that holds a store of width bytes at a into the code, from its code
+        anchor's recorded words. Raises AnchorError when [a, a + width) is not inside those words."""
         name = node[1]
-        if name == 'main': return None
         loc = self.src.get('anchors', {}).get(name, {}).get('code')
         if loc is None: raise AnchorError(f'patch word at {hexu(a)} is in the code but "{name}" is not a code anchor')
         base, _ = self.r.resolve(name)
         old = b''.join(struct.pack('<I', int(x, 16)) for x in loc['old'].split())
         if not (base <= a and a + width <= base + len(old)): raise AnchorError(f'patch word at {hexu(a)} is outside the verified words of {name}')
-        return old[a - base:a - base + width]
+        return int.from_bytes(old[(a & ~3) - base:(a & ~3) - base + 4], 'little')   # code sites are whole aligned words
+
+    def site_word(self, node, a, width, new, token=False):
+        """The value a store of width bytes at a writes on this build: the one place where patches and code templates
+        (gated or not) learn what may be written. In the code: carry_write over a relocated original; then the whole
+        word the store makes (a 1- or 2-byte store's too), when it is not this build's own, must not be a new adrp user
+        (adrp_paired; allowed on the source's own build) and goes through _check_pc_relative. In the cave: a PC-relative
+        word must stay inside the cave. A fixed main address (the cheat names its builds) and a token (re-encoded for
+        this build) are written as they are. AnchorError when refused."""
+        if node[1] == 'main' or token: return new
+        where, a4 = self.b.where(a, width), a & ~3
+        sh, mask = 8 * (a & 3), (1 << 8 * width) - 1
+        if where == 'text':
+            authored, here = self._site_old(node, a, width), self.b.word(a4)
+            got = carry_write(authored, here, new, a, width)
+            if got is None:
+                raise AnchorError(f'the word at {hexu(a4)} is relocated in this build ({here:08X}, was {authored:08X}): '
+                                  'the new word would keep the old build\'s address bits')
+            made = here & ~(mask << sh) | got << sh
+            if made != here:
+                p = adrp_paired(self.b.word, a4, made)
+                if p is not None and self.b.build_id != self.src.get('authored'):
+                    raise AnchorError(f'the word {made:08X} written at {hexu(a4)} takes the page of the adrp at {hexu(p)}: '
+                                      'its low page bits hold for the source\'s own build only')
+                self._check_pc_relative(node, a4, made)
+            return got
+        if where == 'pad':
+            made = self.b.word(a4) & ~(mask << sh) | new << sh
+            t = pc_relative_target(made, a4)
+            if t is not None and self.b.where(t) != 'pad':   # the cave moves as one block: only offsets inside it hold
+                raise AnchorError(f'the word {made:08X} written at {hexu(a4)} in the cave is PC-relative to {hexu(t)}, outside the cave')
+        return new
+
+    def _check_pc_relative(self, node, a, w):
+        """Refuse the PC-relative word w written at a when its target may not be the authored one. Its offset holds
+        when the target lies in the same code anchor's words (they move together; not for an adrp, whose page depends
+        on the page of its own address), or, for a branch, in the site's function found by fingerprint or body digest
+        (the same layout). A function found by its window proves only the words around the site, so then it is refused."""
+        t = pc_relative_target(w, a)
+        if t is None: return
+        loc, (site, how) = self.src['anchors'][node[1]]['code'], self.r.resolve(node[1])
+        if site <= t < site + 4 * len(loc['old'].split()) and w & 0x9f000000 != 0x90000000: return
+        start = site - loc.get('at', 0)
+        if (branch_target(w, a) is not None or is_conditional_branch(w)) and 'size' in loc and how.startswith(('exact', 'body')) \
+                and start <= t < start + loc['size']: return
+        raise AnchorError(f'the word {w:08X} written at {hexu(a)} is PC-relative to {hexu(t)}: its offset is right only inside its own '
+                          'function found by fingerprint or body digest' + (f' (found here by {how})' if 'size' in loc else ''))
 
     def patch(self, cheat):
         """The on and off programs of a patch. Per word: "if it still holds this build's original, write the new word"
         (--plain: just write it); a word equal to the original is written plainly; off puts the originals back where the
-        new words are. Cave words need zeros there in this build; code words must lie inside their verified site. A code
-        word whose original is relocated in this build (only its relocation bits differ from the authored one) may only
-        be restored (the authored word becomes this build's own) or replaced by a token; any other new word would carry
-        the old build's address bits and is refused. Words the rewriter changed are reported (the guard leaves them)."""
-        on, off, how = [], [], set()
+        new words are. Cave words need zeros there in this build; code words must lie inside their verified site, and
+        site_word decides what may be written over a relocated or PC-relative word. Words the rewriter changed are
+        reported: the guard leaves them, so a patch that changes other words too is refused whole (the guard would
+        apply a partial hook, the cave and the branch to it without the rest, or half of a two-word change)."""
+        on, off, how, rewritten, changed = [], [], set(), [], 0
         for w in cheat['patch']:
             if 'at' not in w or 'new' not in w: raise AnchorError('a patch item needs at and new')
             node = parse_expr(w['at'])
@@ -1017,24 +1255,24 @@ class Compiler:
                     try: new = int(v, 16)
                     except ValueError as e: raise AnchorError(f'"{v}" is not a hex word') from e
                 if where == 'pad' and orig: raise AnchorError(f'the cave at {hexu(a)} is not free in this build')
-                if where == 'text':
-                    authored = self._site_old(node, a, width)
-                    if authored is not None and int.from_bytes(authored, 'little') != orig and not token:
-                        if new != int.from_bytes(authored, 'little'):
-                            raise AnchorError(f'the word at {hexu(a)} is relocated in this build ({orig:0{2 * width}X}, was {authored[::-1].hex().upper()}): '
-                                              'the new word would keep the old build\'s address bits')
-                        new = orig   # a restore of the authored original: this build's own word
+                new = self.site_word(node, a, width, new, token)
                 rw = self.b.rewritten(a, width)
                 if rw is not None and int.from_bytes(rw, 'little') != orig:
+                    rewritten.append((a, rw, new != orig))
                     self.warnings.append(f'warning: "{cheat["name"]}": the rewriter changed the word at {hexu(a)} ({rw[::-1].hex().upper()}): '
                                          + ('--plain overwrites the rewritten instruction' if self.plain else 'the guard leaves it, so the cheat has no effect there'))
                 hi, lo = a >> 32, a & 0xffffffff
                 store = [width << 24 | hi, lo, new]
                 if new == orig: on += store; continue
+                changed += 1
                 on += store if self.plain else [0x10050000 | width << 24 | hi, lo, orig] + store + [0x20000000]   # if [a] == orig
                 if where == 'text':
                     back = [width << 24 | hi, lo, orig]
                     off += back if self.plain else [0x10050000 | width << 24 | hi, lo, new] + back + [0x20000000]   # if [a] == new
+        skipped = [a for a, _, changes in rewritten if changes]
+        if skipped and changed > 1 and not self.plain:
+            raise AnchorError(f'the rewriter changed the word at {hexu(skipped[0])}: its guard would skip it and apply the other '
+                              f'{changed - 1} changed word{"s" if changed > 2 else ""} alone (a partial hook); --plain writes them all')
         return on, off, how
 
     def cheat(self, c):
@@ -1048,7 +1286,7 @@ class Compiler:
             off_name = c.get('off_name') or (f'{c["name"]} - off' if c.get('restore') else '')
             out = [(on_name, master, on, dict(base, kind='patch', pair=off_name, how=summary(how)))]
             if off_name:
-                out.append((off_name, False, off, dict(base, kind='patch-off', pair=on_name, how=summary(how))))
+                out.append((off_name, bool(c.get('off_master')), off, dict(base, kind='patch-off', pair=on_name, how=summary(how))))
                 if c.get('off_first'): out.reverse()
             return out
         if 'code' in c:
@@ -1105,7 +1343,8 @@ def render(entries):
             cur = sec
         if words is None: continue
         out.append(('{' + name + '}' if master else '[' + name + ']') + '\n')
-        out += [' '.join(f'{w:08X}' for w in words[i:i + d['n']]) + '\n' for i, d in decode_all(words)]
+        try: out.append(format_words(words, decode_all(words)))
+        except AnchorError: out.append(format_words(words))   # a program kept verbatim (Compiler.code_words): four words per line
         out.append('\n')
     return ''.join(out)
 

@@ -1,7 +1,9 @@
 """scripts/cheat_anchor.py: Atmosphère cheats anchored on one build and compiled for another, on synthetic NSO files built
 from real AArch64 encodings (no game files). Relocated code and data, a changed callee, a resized function, pointer
 slots (RELA and RELR) and code caves are carried over; changed or relocated words, ambiguous or disagreeing evidence and
-outputs this tool did not write are refused, and the emitted words are checked against the VM's encodings.
+outputs this tool did not write are refused, and the emitted words are checked against the VM's encodings. The rules on
+what may be written over a relocated or PC-relative word hold for patches and gated code templates alike; data anchors
+stay in their target's segment; malformed files and undecodable cheats are never shortened or dropped silently.
 """
 import importlib.util
 from pathlib import Path
@@ -49,6 +51,11 @@ def BL(frm, to):
     return B(frm, to) | 0x80000000
 
 
+def BCOND(cond, frm, to):
+    """b.<cond> from frm to to (cond 0 eq, 1 ne): the branch a "flip b.ne to b.eq" cheat writes."""
+    return 0x54000000 | (((to - frm) // 4) & 0x7ffff) << 5 | cond
+
+
 def reader(start, data, field=0x1e, extra=()):
     """A function that loads a u16 field of the object at data: adrp x8; add x8, x8, lo; [extra]; ldrh w0, [x8, #field]; ret."""
     return [ADRP(8, start, data), ADDI(8, 8, data & 0xfff), *extra, LDRH(0, 8, field), RET]
@@ -85,11 +92,12 @@ def image(functions, relocs=(), relr=()):
     return img
 
 
-def nso(path, functions, relocs=(), relr=(), build=b'\x11' * 8, text_end=TEXT_END):
-    """Write an uncompressed NSO of image() with the usual three segments plus bss, and load it as a Build."""
+def nso(path, functions, relocs=(), relr=(), build=b'\x11' * 8, text_end=TEXT_END, data=DATA):
+    """Write an uncompressed NSO of image() with the usual three segments plus bss, and load it as a Build. data moves
+    the start of .data (a build whose .rodata grew); the image's own tables stay below it."""
     img = image(functions, relocs, relr)
     hdr = bytearray(0x100); hdr[:4] = b'NSO0'
-    segs = ((0, text_end), (RO, DATA - RO), (DATA, SIZE - DATA))
+    segs = ((0, text_end), (RO, data - RO), (data, SIZE - data))
     fo = 0x100
     for i, (mo, sz) in enumerate(segs):
         struct.pack_into('<III', hdr, 0x10 + i * 0x10, fo, mo, sz); fo += sz
@@ -271,8 +279,8 @@ class Anchors(unittest.TestCase):
         g = lambda s, data: [ADRP(8, s, data), LDRW(0, 8, data & 0xfff), RET]   # ldr w0, [x8, #lo]: an adrp's user
         old = self.build('a', {0x100: g(0x100, 0x4100)})
         new = self.build('b', {0x100: g(0x100, 0x4180)}, build=B2)
-        _, report, skipped = self.roundtrip(old, new, f'[Next field]\n04000000 00000104 {LDRW(0, 8, 0x104):08X}\n')
-        self.assertEqual(skipped, 1); self.assertIn('relocated in this build', report[0])
+        src, report, bound = ca.import_file(self.txt(f'[Next field]\n04000000 00000104 {LDRW(0, 8, 0x104):08X}\n'), old)
+        self.assertEqual(bound, 1); self.assertIn('takes the page of the adrp at 0x100', ' '.join(report))
         got, report, skipped = self.roundtrip(old, new, f'[Restore]\n04000000 00000104 {LDRW(0, 8, 0x100):08X}\n')
         self.assertEqual(skipped, 0, report); self.assertEqual(got['Restore'][2], [0x04000000, 0x104, LDRW(0, 8, 0x180)])
 
@@ -320,6 +328,204 @@ class Anchors(unittest.TestCase):
         src, report, bound = ca.import_file(self.txt('[x]\n02000000 0000411E 00000001\n[h]\n02100000 00001234 00000001\n', '2222222222222222.txt'), old, assume_build=True)
         self.assertTrue(report[0].startswith('[RED] ')); self.assertEqual(bound, 1)
         self.assertEqual(src['cheats'][1]['builds'], ['2222222222222222'])   # its fixed addresses are the file's build's
+
+    # ---- what may be written over a moved instruction ----
+
+    def test_a_gated_store_follows_the_same_relocation_rule_as_a_patch(self):
+        """A keypress-gated store over a moved bl is refused like the plain patch; a gated restore writes this build's word."""
+        fa = lambda s, callee: [MOVZ(1, 1), BL(s + 4, callee), MOVZ(2, 2), MOVZ(3, 3), RET]
+        callee = [MOVZ(0, 7), MOVZ(5, 9), RET]
+        old = self.build('a', {0x100: fa(0x100, 0x300), 0x300: callee})
+        new = self.build('b', {0x140: fa(0x140, 0x400), 0x400: callee}, build=B2)
+        bad = f'{LDRX(0, 1, 8):08X}'   # a load with an immediate: carries_address_bits, so not over a moved word
+        text = f'[Gated]\n80000040\n04000000 00000104 {bad}\n20000000\n[Plain]\n04000000 00000104 {bad}\n'
+        text += f'[Gated restore]\n80000040\n04000000 00000104 {BL(0x104, 0x300):08X}\n20000000\n'
+        got, report, skipped = self.roundtrip(old, new, text)
+        self.assertEqual(skipped, 2, report)
+        reasons = [r.split('skipped: ')[1] for r in report if 'skipped' in r]
+        self.assertEqual(reasons[0], reasons[1]); self.assertIn('relocated in this build', reasons[0])
+        self.assertEqual(got['Gated restore'][2], [0x80000040, 0x04000000, 0x144, BL(0x144, 0x400), 0x20000000])
+
+    def test_a_word_without_address_bits_may_replace_a_moved_one(self):
+        """A NOP over a moved bl and a mov over a moved adrp user carry no address bits: written, guarded by this build's word."""
+        fa = lambda s, callee, data: [MOVZ(1, 1), BL(s + 4, callee), ADRP(8, s + 8, data), LDRW(0, 8, data & 0xfff), MOVZ(3, 3), RET]
+        callee = [MOVZ(0, 7), MOVZ(5, 9), RET]
+        old = self.build('a', {0x100: fa(0x100, 0x300, 0x4100), 0x300: callee})
+        new = self.build('b', {0x140: fa(0x140, 0x400, 0x4208), 0x400: callee}, build=B2)
+        got, report, skipped = self.roundtrip(old, new, f'[Nop bl]\n04000000 00000104 {NOP:08X}\n[Mov]\n04000000 0000010C {MOVZ(0, 1):08X}\n')
+        self.assertEqual(skipped, 0, report)
+        self.assertEqual(got['Nop bl'][2], [0x14050000, 0x144, BL(0x144, 0x400), 0x04000000, 0x144, NOP, 0x20000000])
+        self.assertEqual(got['Mov'][2], [0x14050000, 0x14c, LDRW(0, 8, 0x208), 0x04000000, 0x14c, MOVZ(0, 1), 0x20000000])
+
+    def test_carries_address_bits_is_false_only_for_address_free_encodings(self):
+        """The classifier: NOP, MOVZ, register-only data processing, RET and FMOV carry no address; everything else, unknown included, does."""
+        free = {'nop': NOP, 'movz': MOVZ(0, 1), 'movk x': 0xf2a00020, 'mov x0, x1': 0xaa0103e0, 'neg': 0xcb0103e0,
+                'add reg': 0x8b020020, 'csel': 0x9a821020, 'mul': 0x9b027c20, 'udiv': 0x9ac20820, 'ret': RET,
+                'fmov s0, s1': 0x1e204020, 'fmov s0, #1.0': 0x1e2e1000}
+        bound = {'bl': BL(0, 0x100), 'b.ne': BCOND(1, 0, 8), 'cbz': 0x34000040, 'tbz': 0x36000040, 'adr': 0x10000040,
+                 'adrp': ADRP(8, 0, 0x4000), 'ldr literal': 0x58000040, 'ldr imm': LDRX(0, 8, 8), 'add imm': ADDI(8, 8, 0x10),
+                 'str imm': 0xf9000100, 'udf': 0, 'move wide opc 01': 0x32800000}
+        for name, w in free.items():
+            with self.subTest(name): self.assertFalse(ca.carries_address_bits(w))
+        for name, w in bound.items():
+            with self.subTest(name): self.assertTrue(ca.carries_address_bits(w))
+
+    def test_a_flipped_conditional_branch_follows_its_function(self):
+        """b.ne flipped to b.eq inside a function that moved: kept as written and checked to be found by fingerprint, refused by window."""
+        def f(s, head=()):
+            """Four distinct words, a b.ne to the function's ret, four more distinct words, ret."""
+            n = len(head)
+            return [*head, *(MOVZ(k, k) for k in range(1, 5)), BCOND(1, s + 4 * (n + 4), s + 4 * (n + 9)), *(MOVZ(k, k) for k in range(5, 9)), RET]
+        old = self.build('a', {0x100: f(0x100)})
+        moved = self.build('b', {0x300: f(0x300)}, build=B2)
+        flip = BCOND(0, 0x110, 0x124)
+        got, report, skipped = self.roundtrip(old, moved, f'[Flip]\n04000000 00000110 {flip:08X}\n')
+        self.assertEqual(skipped, 0, report)
+        self.assertEqual(got['Flip'][2], [0x14050000, 0x310, BCOND(1, 0x310, 0x324), 0x04000000, 0x310, flip, 0x20000000])
+        longer = self.build('c', {0x300: f(0x300, (NOP,))}, build=b'\x33' * 8)   # resized: found by its window only
+        _, report, skipped = self.roundtrip(old, longer, f'[Flip]\n04000000 00000110 {flip:08X}\n')
+        self.assertEqual(skipped, 1); self.assertIn('found here by window', report[0])
+
+    # ---- segments, malformed files, the rest ----
+
+    def test_a_data_anchor_stays_in_its_target_segment(self):
+        """A target at the start of .data is never anchored to a nearer .rodata base, and an old source that crosses is refused."""
+        ro = {0x100: reader(0x100, 0x3ff8), 0x200: reader(0x200, 0x3ff8, 0x20)}   # an object at the end of .rodata
+        old = self.build('a', ro)
+        src, report, bound = ca.import_file(self.txt('[x]\n02000000 00004010 00000001\n'), old)
+        self.assertEqual(bound, 1); self.assertEqual(src['cheats'][0]['builds'], ['1111111111111111'])
+        self.assertIn('no describable code reference', ' '.join(report))
+        # with an object at the start of .data: anchored to it, and found again when .rodata grows and .data moves up
+        # (by a page: Horizon maps each segment on a page boundary, and nso.load refuses one that is not)
+        old = self.build('c', {**ro, 0x300: reader(0x300, 0x4000, 0x22), 0x400: reader(0x400, 0x4000, 0x24)})
+        grown = self.build('d', {**ro, 0x300: reader(0x300, 0x5000, 0x22), 0x400: reader(0x400, 0x5000, 0x24)}, build=B2, data=0x5000)
+        got, report, skipped = self.roundtrip(old, grown, '[x]\n02000000 00004010 00000001\n')
+        self.assertEqual(skipped, 0, report); self.assertEqual(got['x'][2][1], 0x5010)
+        # a source that anchors the .data target on the .rodata object (what import used to write) is refused
+        refs = ', '.join(f'{{ old = "{old.word(s):08X}", size = 0x10, at = 0x0, use = 0x4, fp = "{old.digest(s, "fp")}" }}' for s in (0x100, 0x200))
+        self.source(f'format = 1\n[[cheats]]\nname = "x"\ntarget = "d_3FF8+0x18"\ntype = "u16"\nvalue = 1\n[anchors.d_3FF8]\ndata = [{refs}]\n')
+        _, _, report, skipped = ca.compile_source(self.dir / 's.cheats.toml', old)
+        self.assertEqual(skipped, 1); self.assertIn('crosses from ro into data', report[0])
+
+    def test_glued_words_are_split_and_stray_tokens_make_a_cheat_malformed(self):
+        """Glued words split like Atmosphère reads them; prose lines are ignored like the host does; junk on a code
+        line, or a cut word, keeps the cheat whole, bound and refused, with its line; such a token survives the TOML."""
+        entries, warns = ca.parse_atmosphere('[A]\n0400000000004100 00000001\n')
+        self.assertEqual(entries, [('A', False, [0x04000000, 0x4100, 1], [])])
+        old = self.build('a', {0x100: reader(0x100, 0x4100), 0x200: reader(0x200, 0x4100, 0x20)})
+        text = ('[B]\n80000001\n04000000 00004100 00000001\n2000000\n[C]\nby someone\n04000000 00004104 00000002\n'
+                '[Credits]\nMade by X\n[D]\n04000000 00004108 00000003 x""""y\n')
+        src, report, bound = ca.import_file(self.txt(text), old)
+        self.assertEqual(bound, 2)
+        b, cr, d = (next(c for c in src['cheats'] if c['name'] == n) for n in ('B', 'Credits', 'D'))
+        self.assertIn('2000000', b['code']); self.assertIn('x""""y', d['code']); self.assertTrue(cr.get('label'))   # never shortened
+        self.assertTrue(any('"B"' in r and 'line 4: "2000000"' in r for r in report), report)
+        self.assertTrue(any('"by" in "C"' in r and 'ignored' in r for r in report), report)
+        ca.write_toml(src, self.dir / 'g.cheats.toml', 'cheats.txt')
+        self.assertIn('x""""y', tomllib.loads((self.dir / 'g.cheats.toml').read_text())['cheats'][3]['code'])
+        _, entries, report, skipped = ca.compile_source(self.dir / 'g.cheats.toml', old)   # refused even on its own build
+        self.assertEqual(skipped, 2); self.assertEqual([e[0] for e in entries if e[2] is not None], ['C', 'Credits'])
+
+    def test_an_undecodable_cheat_is_kept_verbatim_on_its_own_build(self):
+        """A cheat the decoder cannot read is emitted word for word on its own build, and skipped on any other."""
+        old = self.build('a', {0x100: reader(0x100, 0x4100)})
+        new = self.build('b', {0x100: reader(0x100, 0x4100)}, build=B2)
+        got, report, skipped = self.roundtrip(old, old, '[Weird]\nB0000000 00000001\n')
+        self.assertEqual(skipped, 0, report); self.assertEqual(got['Weird'][2], [0xB0000000, 1])
+        self.assertIn('[Weird]\nB0000000 00000001\n', ca.render(list(got.values())))
+        _, entries, report, skipped = ca.compile_source(self.dir / 'g.cheats.toml', new)
+        self.assertEqual(skipped, 1)
+
+    def test_a_file_named_after_the_title_id_names_no_build(self):
+        """A file named after the title ID is taken as written for the NSO's build, not refused as another build's."""
+        (self.dir / 't').mkdir()
+        npdm = bytearray(0xa0); struct.pack_into('<I', npdm, 0x70, 0x80); npdm[0x80:0x84] = b'ACI0'
+        struct.pack_into('<Q', npdm, 0x90, 0x0100abcd00000000); (self.dir / 't/main.npdm').write_bytes(npdm)
+        old = self.build('t/main', {0x100: reader(0x100, 0x4100), 0x200: reader(0x200, 0x4100, 0x20)})
+        self.assertEqual(old.title, '0100ABCD00000000')
+        src, report, bound = ca.import_file(self.txt('[h]\n02100000 00001234 00000001\n', '0100ABCD00000000.txt'), old)
+        self.assertEqual(bound, 1); self.assertEqual(src['cheats'][0]['builds'], ['1111111111111111'])
+
+    def test_a_merged_pair_keeps_its_master_flag(self):
+        """A master on or off entry stays a master after its on / off pair is merged."""
+        old = self.build('a', {0x100: [0xaa1703e0, NOP, LDRH(0, 0, 0x34), 0x1e2e1000, RET]})
+        for off_head, off_master in (('[Fast - off]', False), ('{Fast - off}', True)):
+            with self.subTest(off_head):
+                src, _, _ = ca.import_file(self.txt(f'{{Fast - on}}\n04000000 0000010C 1E2F1000\n{off_head}\n04000000 0000010C 1E2E1000\n'), old)
+                self.assertEqual([c.get('on_name') for c in src['cheats']], ['Fast - on'])   # merged into one cheat
+                ca.write_toml(src, self.dir / 'g.cheats.toml', 'cheats.txt')
+                _, entries, report, skipped = ca.compile_source(self.dir / 'g.cheats.toml', old)
+                self.assertEqual([(e[0], e[1]) for e in entries], [('Fast - on', True), ('Fast - off', off_master)])
+
+    def test_only_opcode_0_literals_are_carried_into_the_code(self):
+        """A register store (opcode A) into the code is bound to its build: its value never meets the relocation rule."""
+        fa = lambda s, callee: [MOVZ(1, 1), BL(s + 4, callee), MOVZ(2, 2), MOVZ(3, 3), RET]
+        old = self.build('a', {0x100: fa(0x100, 0x300), 0x300: [MOVZ(0, 7), RET]})
+        src, report, bound = ca.import_file(self.txt(f'[RegStore]\n400F0000 00000000 {BL(0x104, 0x308):08X}\nA4F00400 00000104\n'), old)
+        self.assertEqual(bound, 1); self.assertIn('a store of a register into the code at 0x104', ' '.join(report))
+
+    def test_a_new_adrp_user_over_an_unmoved_word_is_bound(self):
+        """A new word that takes a preceding adrp's page keeps this build's low page bits: bound at import, refused at compile elsewhere."""
+        f = lambda s, data: [ADRP(8, s, data), LDRW(1, 8, data & 0xfff), MOVZ(0, 2), MOVZ(3, 3), RET]
+        old = self.build('a', {0x100: f(0x100, 0x4100)})
+        new = self.build('b', {0x100: f(0x100, 0x4180)}, build=B2)   # the data moved inside its page, the code did not
+        text = f'[Neighbour]\n04000000 00000108 {LDRW(0, 8, 0x104):08X}\n'
+        src, report, bound = ca.import_file(self.txt(text), old)
+        self.assertEqual(bound, 1); self.assertIn('takes the page of the adrp at 0x100', ' '.join(report))
+        self.source(f'format = 1\nauthored = "1111111111111111"\n[[cheats]]\nname = "N"\npatch = [{{ at = "s_108", new = "{LDRW(0, 8, 0x104):08X}" }}]\n'
+                    f'[anchors.s_108]\ncode = {{ old = "{MOVZ(0, 2):08X}", size = 0x14, at = 0x8, fp = "{old.digest(0x100, "fp")}" }}\n')
+        _, entries, report, skipped = ca.compile_source(self.dir / 's.cheats.toml', old)
+        self.assertEqual(skipped, 0, report)   # its own build: the word is right there
+        _, entries, report, skipped = ca.compile_source(self.dir / 's.cheats.toml', new)
+        self.assertEqual(skipped, 1); self.assertIn('takes the page of the adrp', report[0])
+
+    def test_a_narrow_write_is_checked_by_the_word_it_makes(self):
+        """A 2-byte write that retargets a bl is bound at import, and refused at compile when the site was found by its window."""
+        F = lambda s, g: [MOVZ(1, 1), BL(s + 4, g), MOVZ(2, 2), MOVZ(3, 3), RET]
+        old = self.build('a', {0x100: F(0x100, 0x400), 0x400: [MOVZ(0, 7), RET], 0x500: [MOVZ(0, 8), MOVZ(6, 9), RET]})
+        src, report, bound = ca.import_file(self.txt(f'[ToH]\n02000000 00000104 0000{BL(0x104, 0x500) & 0xffff:04X}\n'), old)
+        self.assertEqual(bound, 1); self.assertIn('makes 940000FF, PC-relative to 0x500', ' '.join(report))
+        self.source(f'format = 1\n[[cheats]]\nname = "N"\npatch = [{{ at = "s_104", width = 2, new = "{BL(0x104, 0x500) & 0xffff:04X}" }}]\n'
+                    f'[anchors.s_104]\ncode = {{ old = "{BL(0x104, 0x400):08X}", size = 0x14, at = 0x4, fp = "{old.digest(0x100, "fp")}" }}\n')
+        _, entries, report, skipped = ca.compile_source(self.dir / 's.cheats.toml', old)
+        self.assertEqual(skipped, 1); self.assertIn('PC-relative to 0x500', report[0])
+
+    def test_a_compare_with_a_moved_original_compares_with_this_builds_word(self):
+        """An "if [X] == original" gate over a moved bl compares with this build's word, so it still opens."""
+        fa = lambda s, callee: [MOVZ(1, 1), BL(s + 4, callee), MOVZ(2, 2), MOVZ(3, 3), RET]
+        old = self.build('a', {0x100: fa(0x100, 0x300), 0x300: [MOVZ(0, 7), RET]})
+        new = self.build('b', {0x140: fa(0x140, 0x400), 0x400: [MOVZ(0, 7), RET]}, build=B2)
+        text = f'[Gate]\n14050000 00000104 {BL(0x104, 0x300):08X}\n04000000 00000104 {NOP:08X}\n20000000\n'
+        got, report, skipped = self.roundtrip(old, new, text)
+        self.assertEqual(skipped, 0, report)
+        self.assertEqual(got['Gate'][2], [0x14050000, 0x144, BL(0x144, 0x400), 0x04000000, 0x144, NOP, 0x20000000])
+
+    def test_a_store_offset_by_r0_the_cheat_sets_is_indexed(self):
+        """The VM adds the offset register, r0 included: a store into code offset by an r0 the cheat loads is not static."""
+        old = self.build('a', {0x100: [0xaa1703e0, NOP, LDRH(0, 0, 0x34), 0x1e2e1000, RET]})
+        src, report, bound = ca.import_file(self.txt('[R0]\n40000000 00000000 00000004\n04000000 0000010C 1E2F1000\n'), old)
+        self.assertEqual(bound, 1); self.assertIn('indexed by register 0', ' '.join(report))
+
+    def test_a_data_anchor_found_among_identical_copies_by_order_is_weak(self):
+        """Data references resolved among identical copies by order alone keep the weak mark."""
+        old = self.build('a', {0x100: reader(0x100, 0x4100), 0x300: reader(0x300, 0x4100)})
+        new = self.build('b', {0x500: reader(0x500, 0x4180), 0x900: reader(0x900, 0x4180)}, build=B2)
+        got, report, skipped = self.roundtrip(old, new, '[x]\n02000000 0000411E 00000001\n')
+        self.assertEqual(skipped, 0, report); self.assertEqual(got['x'][2][1], 0x419e)
+        self.assertIn('weak: 2 of them identical copies by order', got['x'][3]['how'])
+        self.assertTrue(any('resolved weakly' in r for r in report))
+
+    def test_a_multi_word_patch_with_a_rewritten_word_is_skipped_whole(self):
+        """A patch whose guard would skip one rewritten word and apply the other is refused instead of half-written."""
+        f = [0xaa1703e0, NOP, LDRH(0, 0, 0x34), 0x1e2e1000, RET]
+        old = self.build('a', {0x100: f})
+        new = self.build('b/extract/v1/ExeFS/main', {0x200: f}, build=B2)
+        rewritten = bytearray(new.img); struct.pack_into('<I', rewritten, 0x20c, 0x14000000)
+        (self.dir / 'b/patched_v1').mkdir(); (self.dir / 'b/patched_v1/main.patched.bin').write_bytes(rewritten)
+        new = ca.Build(self.dir / 'b/extract/v1/ExeFS/main')
+        _, report, skipped = self.roundtrip(old, new, '[Two]\n04000000 00000108 D2800020\n04000000 0000010C 1E2F1000\n')
+        self.assertEqual(skipped, 1); self.assertIn('partial hook', report[0])
+        self.assertTrue(any('the rewriter changed the word at 0x20C' in r for r in report), report)
 
     # ---- the source and the outputs ----
 
