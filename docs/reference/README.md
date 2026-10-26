@@ -5,7 +5,7 @@ How the host meets each part of a Switch game, and every failure met so far, one
 | File | Covers |
 |---|---|
 | [packing.md](packing.md) | NSP script, compressed inputs and build artifacts |
-| [rewriter.md](rewriter.md) | The NSO rewriter `patch_nso.py`: jump tables, exclusive windows, patch area reach, cuts and observation gates, functions without unwind entries, stack and system registers, relocations |
+| [rewriter.md](rewriter.md) | The NSO rewriter `patch_nso.py`: jump tables, exclusive windows, patch area reach, cuts and observation gates (and cheats carried across builds with the same matcher), functions without unwind entries, stack and system registers, relocations |
 | [memory.md](memory.md) | Guest layout, heap and application pool, virtual address memory and the alias region (the SDK's node area), engine allocators, mapping SVCs, running out of memory |
 | [threads.md](threads.md) | Thread creation and cores, address arbitration, yields and spin waits, events |
 | [services.md](services.md) | SDK calls and system services: sm connections, names that changed between SDKs, file system and saves, add-on content, input, keyboard and applets, display and operation mode, accounts and network, settings and fonts, C library and time, modules |

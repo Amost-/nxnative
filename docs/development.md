@@ -27,6 +27,51 @@ Switches:
 
 Implemented opcodes: 0 store static, 1 (the six memory comparisons), 2 end/else, 3 loop, 4/5 load register, 6 store static to a register address, 7 register arithmetic, 8 key-press conditional (button bits 0–15, stick directions 16–23) — all with the reference's word order and block-skipping (`dmnt_cheat_vm.cpp`). Others (register arithmetic 9, store register A/B, the register conditionals C0…, pause/resume, the debug log) mark the whole cheat `(unsupported opcode N)`, shown disabled in the menu and never run; main NSO and heap are the mapped regions (a game that never opens the heap refuses heap cheats with `[RED]`).
 
+### Cheats that survive game updates
+
+`scripts/cheat_anchor.py` carries cheats from one build of a game to another. An Atmosphère file names fixed offsets of one build. The script first converts such a file into a version-independent source, `<game>.cheats.toml`, where each address is described by the game's own code. Then it compiles that source into the plain `<build ID>.txt` of any build. It needs only the build's `ExeFS/main`, which the NSP script extracts to `<title ID>_build/extract/v<version>/ExeFS/`. The compiled file is ordinary Atmosphère text: this host, a Switch, Ryujinx and yuzu forks all run it.
+
+```
+python3 scripts/cheat_anchor.py import E1D8B399B787AE41.txt --nso <build folder>/extract/v196608/ExeFS/main -o FFCC.cheats.toml
+python3 scripts/cheat_anchor.py compile FFCC.cheats.toml --nso <another build's ExeFS/main> -o <cheats folder>
+python3 scripts/cheat_anchor.py check FFCC.cheats.toml --nso <ExeFS/main>    # the report only
+```
+
+- **Anchors** (written by `import`, kept at the end of the source):
+  - *data*: the nearest address at or below the target that the code references, plus a field offset. The nearest keeps the offset from crossing into an unrelated variable. The anchor stores up to four adrp + add / ldr / str pairs that compute it, in functions identified as below. With `deref = true` the pairs compute `.data` slots, and the anchor is the target of their relative relocations (RELA or RELR; FFCC's stats live in the object behind such a slot). At least two references must agree on the address (one when there is only one) and none may disagree. An anchor with a single reference is reported as weak.
+  - *code*: the words one cheat writes in one contiguous run (they move together), with their original words.
+  - *cave*: the zero padding between the end of the text and the read-only data, kept at the same distance before the read-only data. ASM cheats put their own code there.
+- **Finding a function:**
+  1. a unique function with the same length and fingerprint (its body and its direct callees): the test of the rewriter's [function-matched cuts](reference/rewriter.md#function-matched-cuts-for-unregistered-builds) (`dm/tools/nso_match.py`);
+  2. this tool's first fallback: a unique function with the same body digest alone (a callee changed);
+  3. its second fallback: a window of 9 to 33 relocation-masked instructions around the site that occurs once in the whole text.
+
+  The first way that finds a candidate decides. No approximate similarity is used. A code site's original words must match at the new place, raw or, when only relocation bits moved, masked. A patch may not overwrite such a relocated word with a word of the old build (only restore it, or replace it with a branch token).
+
+  Identical copies of a function are taken in address order. The copy is confirmed when the window finds the same one, refused when the window points to another, and otherwise reported as weak (`by order: weak`). Data references are checked by decoding the adrp pair at the found place.
+- **Cheats** in the source, in file order:
+  - `target` + `type` (u8…u64, s8…s64, f32, f64) + `action` + `value`, where the action is one of:
+    - `freeze`: written on every pass;
+    - `set`: the meta file marks it to be applied once;
+    - `min` / `max`: an opcode 1 comparison, which is unsigned, so only unsigned types.
+
+    `value = "ask"` with `min`, `max` and `default` marks the value for the panel to ask for. A target can be a pointer chain, `[anchor+0x8]+0x38` (freeze and set only). The chain uses register 15 and zeroes it afterwards, because dmnt runs all enabled cheats as one program. `import` turns a single store into data into this form.
+  - `patch`: stores into the code and the cave.
+    - Each word is guarded with "if it still holds this build's original" (`--plain` drops the guards, for build-time baking). The optional off entry puts the originals back.
+    - A B / BL to outside the run it is written in is a token (`bl:cave+0x10`), re-encoded per build.
+    - The NSP script puts the rewriter's output of the build at `<title ID>_build/patched_v<version>/main.patched.bin`. When it is there, a word the rewriter changed is reported: the guard leaves such a word alone.
+    - `import` merges an "X - on" / "X - off" pair whose off entry restores exactly the on entry's code sites. Both names and their order stay, so saved toggles stay valid.
+  - `code`: any other program, kept word for word with `{anchor+offset}` tokens in place of its main-relative addresses.
+  - `label`: an empty entry (a credits line). `section` puts EdiZon's `[--SectionStart:Name--]` / `[--SectionEnd:Name--]` entries around a run of cheats.
+  - Addresses that cannot be anchored, such as heap or alias addresses or a store into the code indexed by a register, keep their words. They come with `builds = [...]` and compile only for those builds.
+- **Outputs:**
+  - `compile` writes `<build ID>.txt` and `<build ID>.meta.tsv`. The meta file has one row per entry: kind, section, type, action, value, ask bounds, the program words that hold the value, on/off pair, how each anchor was resolved, and the reason a cheat was skipped. Its header names the source and the builds' display versions.
+  - Only an unchanged `.txt` that this source compiled is rewritten. The meta file records the `.txt`'s SHA-256 and the source's name. A hand-made, edited or other source's `.txt` is kept: the output goes to `<build ID>.txt.new`, or with `--replace` the old file is kept as `.orig`.
+  - Skipped cheats are left out of the `.txt` with a `[RED]` line in the report. Weak resolutions are listed, and so is a cheat over Atmosphère's 0x100 words, which a Switch refuses (the guards make patches longer).
+  - Exit status: 0 everything resolved, 2 some cheats skipped (or, for `import`, kept bound to one build), 1 an error.
+  - `import` refuses a file named after another build unless `--assume-build`; its unanchored cheats then stay bound to the file's own build. `import` also counts the writes into the code that put back the word already there (restore entries): evidence that the file belongs to the NSO's build.
+- **Not yet:** never-decrease (Atmosphère's VM keeps no state of a cheat between passes), `min` / `max` through pointer chains (they need the register conditional C0), anchors by IL2CPP names. Validation on FFCC and 13 Sentinels: [Cheats carried across game updates](reference/rewriter.md#cheats-carried-across-game-updates).
+
 ## Guest memory SVCs
 
 `dm/host/hle_svc.c` serializes heap resizing, physical map/unmap, stack
