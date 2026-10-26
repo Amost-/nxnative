@@ -360,6 +360,11 @@ name = "Leading zero"
 target = "d_4100+010"
 type = "u8"
 value = 1
+[[cheats]]
+name = "HP never decreases"
+target = "d_4100+0x1C"
+type = "s16"
+action = "never-decrease"
 [anchors.d_4100]
 data = [{refs}]
 ''')
@@ -371,9 +376,16 @@ data = [{refs}]
         self.assertEqual(got['Mog'][2], [0x18060000, 0x4108, 0, 0, 0x580f0000, 0x4108, 0x780f0000, 0x38,
                                          0x640f0000, 0, 0, 0x400f0000, 0, 0, 0x20000000])   # r15 is zeroed after the chain
         self.assertEqual(got['Leading zero'][2][1], 0x410a)   # decimal 010 = 10
+        nd = got['HP never decreases']   # no Atmosphère program: the host runs it from the meta row
+        self.assertEqual((nd[2], nd[3]['action'], nd[3]['address'], nd[3]['type']), ([], 'never-decrease', '0:0x411C', 's16'))
+        self.assertIn('nxnative only', nd[3]['how'])
         self.assertEqual(skipped, 1); self.assertIn('only unsigned types', [r for r in report if 'Signed' in r][0])
         text = ca.render(entries)
         self.assertIn('[--SectionStart:Items--]\n\n[Gold]\n04000000 00004140 000001F4\n\n[--SectionEnd:Items--]', text)
+        self.assertIn('[HP never decreases]\n\n', text)   # an empty entry: an inert label on other engines
+        meta = ca.meta_text('s.cheats.toml', old, entries, {}, text).split('\n')
+        head = meta[2].split('\t'); row = dict(zip(head, next(l for l in meta if l.startswith('HP never')).split('\t')))
+        self.assertEqual((row['action'], row['address'], row['type']), ('never-decrease', '0:0x411C', 's16'))
 
     def test_instruction_lengths_of_every_form(self):
         """Instruction lengths of the forms the host VM does not run yet: a wrong length would misread every later word of a community file."""

@@ -481,10 +481,11 @@ static NSControlStateValue cheat_row_state(int i) {
 // Select All / Deselect All: flip every plain cheat (kind 0) that is not already in the wanted state, then one refresh.
 // The loop over dm_cheat_toggle instead of a new bulk call is deliberate: the C API stays as it is, each toggle rewrites
 // <build ID>.enabled once (a few tiny writes), and a cheat pass that runs between two toggles sees a mix for one frame,
-// which is harmless. Masters (kind 1) and disabled cheats (kind 2) are never touched — they have no state to change
+// which is harmless. Masters (kind 1), disabled cheats (kind 2) and labels (kind 3) are never touched — they have no state
+// to change — and neither is the off half of an on / off pair: hle_cheats.c switches it with its on half
 - (void)setPlainCheatsOn:(BOOL)on {
     for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
-        if (dm_cheat_kind_at(i) != 0) continue;
+        if (dm_cheat_kind_at(i) != 0 || (dm_cheat_flags_at(i) & DM_CHEAT_PAIR_OFF)) continue;
         if (!!dm_cheat_on_at(i) == on) continue;
         dm_cheat_toggle(i);
     }
@@ -509,7 +510,7 @@ static NSControlStateValue cheat_row_state(int i) {
 - (void)updateSelectButtons {
     BOOL someOff = NO, someOn = NO;
     for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
-        if (dm_cheat_kind_at(i) != 0) continue;
+        if (dm_cheat_kind_at(i) != 0 || (dm_cheat_flags_at(i) & DM_CHEAT_PAIR_OFF)) continue;   // the off half follows its on half
         if (dm_cheat_on_at(i)) someOn = YES; else someOff = YES;
         if (someOn && someOff) break;
     }

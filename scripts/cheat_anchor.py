@@ -919,7 +919,10 @@ class Compiler:
         return width, int.from_bytes(raw, 'little')
 
     def data(self, cheat):
-        """The program of a data cheat (freeze, set, min, max), how it resolved, and its meta (where its value words are)."""
+        """The program of a data cheat (freeze, set, min, max), how it resolved, and its meta (where its value words are,
+        the static target as region:offset). never-decrease has no Atmosphère program: Atmosphère's VM keeps no state of
+        a cheat between passes, so nxnative's host runs it from the meta row (type and address) and the .txt holds an
+        empty entry of that name, which other engines show as an inert label."""
         action, v = cheat.get('action', 'freeze'), cheat.get('value', 0)
         ask = v == 'ask'
         if ask: v = cheat.get('default', cheat.get('min', 0))
@@ -928,12 +931,18 @@ class Compiler:
         node = parse_expr(cheat['target'])
         meta = {'type': cheat.get('type', 'u32'), 'action': action, 'value': str(v)}
         if ask: meta['ask'] = f'{cheat.get("min", "")}..{cheat.get("max", "")}'
+        if action == 'never-decrease':
+            if node[0] == 'deref': raise AnchorError('never-decrease through a pointer chain is not supported yet')
+            region, off, how = self.addr(node, cheat)
+            meta.update(address=f'{region}:{hexu(off)}', value='')
+            return [], how + '; nxnative only: the host keeps the highest value, other engines see an empty entry', meta
         if action in ('freeze', 'set'):
             if node[0] == 'deref': words, how = self.chain(node, width, vw, cheat)
             else:
                 region, off, how = self.addr(node, cheat)
                 words = [width << 24 | region << 20 | off >> 32, off & 0xffffffff] + vw
                 meta['value_words'] = ','.join(str(2 + k) for k in range(len(vw)))
+                meta['address'] = f'{region}:{hexu(off)}'
             if action == 'set': meta['once'] = '1'
             return words, how, meta
         if action in ('min', 'max'):
@@ -945,6 +954,7 @@ class Compiler:
             hi, lo = off >> 32, off & 0xffffffff
             words = [0x10000000 | width << 24 | region << 20 | cond << 16 | hi, lo] + vw + [width << 24 | region << 20 | hi, lo] + vw + [0x20000000]
             meta['value_words'] = ','.join(str(k) for k in [*range(2, 2 + len(vw)), *range(4 + len(vw), 4 + 2 * len(vw))])
+            meta['address'] = f'{region}:{hexu(off)}'
             return words, how, meta
         raise AnchorError(f'action "{action}" is not supported by this version of the tool')
 
@@ -1100,7 +1110,7 @@ def render(entries):
     return ''.join(out)
 
 
-META_HEAD = 'name\tkind\tsection\ttype\taction\tvalue\task\tvalue_words\tonce\tpair\tresolved\tnote'
+META_HEAD = 'name\tkind\tsection\ttype\taction\tvalue\task\tvalue_words\tonce\tpair\tresolved\tnote\taddress'   # the host reads it by column name
 META_FIRST = re.compile(r'# cheat_anchor\.py: compiled from (.*) for build ([0-9A-F]{16}) on ')
 META_HASH = re.compile(r'# txt sha256 ([0-9a-f]{64})$')
 
@@ -1116,7 +1126,8 @@ def meta_text(src_name, build, entries, src, txt):
     out += [f'# build {k} {v}' for k, v in names.items()] + [META_HEAD]
     for name, _, _, m in entries:
         row = [name, m.get('kind', ''), m.get('section', ''), m.get('type', ''), m.get('action', ''), m.get('value', ''),
-               m.get('ask', ''), m.get('value_words', ''), m.get('once', ''), m.get('pair', ''), m.get('how', ''), m.get('note', '')]
+               m.get('ask', ''), m.get('value_words', ''), m.get('once', ''), m.get('pair', ''), m.get('how', ''), m.get('note', ''),
+               m.get('address', '')]
         out.append('\t'.join(str(x).replace('\t', ' ').replace('\n', ' ') for x in row))
     return '\n'.join(out) + '\n'
 
