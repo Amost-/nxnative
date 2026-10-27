@@ -485,6 +485,7 @@ static DmCheatsMenuDelegate *g_cheats_menu;   // NSMenu keeps its delegate unret
     int _detailsFor;              // the cheat whose details are shown (-1: the report, -2: nothing)
     NSTimer *_refreshTimer;       // ~1 s, scheduled only while the panel is on screen; invalidated when it hides
     BOOL _upOnDeactivate;         // the panel was on screen when the app was deactivated: AppKit brings it back on activation
+    BOOL _finding;                // a Find Cheats… scan is running on a background queue: another click does not start a second one
 }
 
 // A button of the panel's toolbar rows
@@ -715,10 +716,11 @@ static NSTextField *panel_note(NSString *text) {
 // The cheat files of this game the usual places hold, this build's own first:
 //   - Ryujinx: mods/contents/<title ID>/cheats/ and its mods' own cheats folders (mods/contents/<title ID>/<mod>/cheats/);
 //   - the yuzu family: load/<title ID>/<mod>/cheats/;
-//   - the Atmosphère tree of a mounted local volume (an SD card); network volumes are not listed (a stall on the main thread).
+//   - the Atmosphère tree of a mounted local volume (an SD card); network volumes are not listed (a stall even off the main thread).
 // Only the .txt files named after a build ID count (not Ryujinx's enabled.txt); each folder is read once whatever case
-// the path came in
-- (NSArray<NSURL *> *)foundCheatFiles {
+// the path came in. build: this build's ID (read from the engine on the main thread by the caller). Runs on a background
+// queue (findCheats:): it touches only the file system and Foundation, never AppKit or the cheats engine
+static NSArray<NSURL *> *found_cheat_files(NSString *build) {
     NSString *tid = [NSString stringWithFormat:@"%016llX", (unsigned long long)DM_GAME_PROGRAM_ID];
     NSString *as = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support"];
     NSMutableArray<NSString *> *dirs = [NSMutableArray array];
@@ -738,7 +740,6 @@ static NSTextField *panel_note(NSString *text) {
     }
     NSMutableArray<NSURL *> *mine = [NSMutableArray array], *rest = [NSMutableArray array];
     NSMutableSet<NSString *> *seen = [NSMutableSet set];
-    NSString *build = engine_str(dm_cheats_build());
     NSCharacterSet *nothex = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"].invertedSet;
     for (NSString *d in dirs) {
         NSString *real = [d stringByResolvingSymlinksInPath].lowercaseString;   // one folder however its path was spelled
@@ -754,9 +755,28 @@ static NSTextField *panel_note(NSString *text) {
     return mine;
 }
 
-// Find Cheats…: a menu of the files found, under the button; picking one imports it
+// Find Cheats…: a menu of the files found, under the button; picking one imports it. The folders are read on a background
+// queue, since a sleeping external disk can take seconds to answer and the main thread would beachball the game window
+// meanwhile; the button reads "Looking…" and is disabled until the scan ends, and _finding keeps a second click (or an
+// action sent while disabled) from starting another scan. The menu is built and shown on the main queue, and only while
+// the panel is still on screen (it hides when the app is deactivated): a menu popping up out of nowhere would be worse
 - (void)findCheats:(NSButton *)b {
-    NSArray<NSURL *> *found = [self foundCheatFiles];
+    if (_finding) return;
+    _finding = YES;
+    NSString *title = b.title;
+    b.title = @"Looking…"; b.enabled = NO;
+    NSString *build = engine_str(dm_cheats_build());   // the engine's state is read here, on the main thread, not by the scan
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSArray<NSURL *> *found = found_cheat_files(build);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_finding = NO;
+            b.title = title; b.enabled = YES;
+            if (b.window.visible) [self showFound:found under:b];
+        });
+    });
+}
+// The files a Find Cheats… scan found, as a menu under its button (main thread)
+- (void)showFound:(NSArray<NSURL *> *)found under:(NSButton *)b {
     NSMenu *m = [NSMenu new];
     if (!found.count) [m addItemWithTitle:@"No cheat files of this game in Ryujinx, the yuzu family or an SD card" action:nil keyEquivalent:@""].enabled = NO;
     for (NSURL *u in found) {
