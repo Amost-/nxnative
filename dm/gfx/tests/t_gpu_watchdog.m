@@ -48,6 +48,46 @@ int main(void) { @autoreleasepool {
     char small[64]; small[0] = 0; int o = subrec_fmt(small, sizeof small, 0, r, 0);
     CHECK(o == (int)sizeof small - 1 && strlen(small) == sizeof small - 1, "a line too short for the record is cut at its end, not past it");
 
+    // Draws through a pulling stand-in: counted in the header, their pair marked in its command buffer only
+    g_stat_pass = 2000; r = begin(13);
+    subrec_add("aaaa", "bbbb", &A, 0); subrec_add("cccc", "dddd", &B, 0); subrec_pull("aaaa", "bbbb"); subrec_cut(); subrec_add("aaaa", "bbbb", &A, 0);
+    commit();
+    text(r, 0, buf, sizeof buf);
+    CHECK(r->pulls == 1 && has(buf, "from pass 2000, 1 draws through a pulling stand-in): cb 0: pass +0 aaaa/bbbb+pull cccc/dddd | cb 1: pass +0 aaaa/bbbb;"), "pulling draws counted, their pair marked");
+
+    // Task / mesh draws: a direct one's count and first, a GPU-written one's converted arguments as they are when printed; past SUBREC_MESH only counted
+    g_stat_pass = 2000; r = begin(12);
+    uint32_t args[8] = {0};
+    subrec_mesh_add("a5288d0a6c4971fd", "a80a03d4747a70c7", "de4c1ebffd6c3960", 12, 3, NULL);
+    g_stat_pass += 4; subrec_cut(); subrec_mesh_add("a5288d0a6c4971fd", "842d6cfcc9e9df67", NULL, 0, 0, args);
+    setenv("DM_NVN_MESHLOG_CB", "2:3088", 1);   // the second draw: four words of uniform register 2 at byte 3088, read when it was recorded
+    static uint32_t ub[1024]; ub[772] = 160; ub[773] = 90; ub[774] = 7; ub[775] = 0xdeadbeef; ub[771] = 1;
+    p_bind_buf ubo[16] = {0}; ubo[2] = (p_bind_buf){3, 2, (uintptr_t)ub, sizeof ub};
+    subrec_mesh_words(ubo);
+    ub[772] = 0;   // a later write is not what that draw saw
+    args[0] = 65535; args[4] = 40;
+    for (int i = 0; i < SUBREC_MESH; i++) subrec_mesh_add(NULL, "1111", "2222", 1, 0, NULL);
+    commit();
+    CHECK(r->nm == SUBREC_MESH && r->nm_more == 2, "task / mesh draws past the record's room are counted");
+    subrec_mesh_fmt(buf, sizeof buf, r);
+    char want[512]; snprintf(want, sizeof want, "[RED] task / mesh draws of the failed submission fence 12 (26, the first listed): cb 0 pass +0 a5288d0a6c4971fd/a80a03d4747a70c7/de4c1ebffd6c3960 direct 12 from 3,"
+        " cb 1 pass +4 a5288d0a6c4971fd/842d6cfcc9e9df67/- indirect 65535 from 40 (task uniform words 0xa0 0x5a 0x7 0xdeadbeef at +3088 of the buffer bound at guest %#llx, size %zu, Metal GPU 0),"
+        " cb 1 pass +4 -/1111/2222 direct 1 from 0,", (unsigned long long)(uintptr_t)ub, sizeof ub);
+    CHECK(has(buf, want), "each task / mesh draw with its grid, a GPU-written one read at print time, the uniform words as recorded with where the buffer was bound (no pool: no GPU address, no 'now')");
+
+    // The same words from a buffer in a memory pool: its Metal GPU address, the memory as it is when the report prints (a later write shows), and the GPU's own copy when there is one
+    { void *mem = NULL; CHECK(!posix_memalign(&mem, getpagesize(), getpagesize()), "a page for the pool"); memset(mem, 0, getpagesize()); mtl_pool_add(mem, getpagesize());
+      uint32_t *pw = mem; pw[772] = 160; pw[773] = 90; pw[774] = 7; pw[775] = 1;
+      static const uint32_t gpu_saw[4] = {160, 90, 7, 0x7fffffff};
+      r = begin(14); subrec_mesh_add("a5288d0a6c4971fd", "a80a03d4747a70c7", "de4c1ebffd6c3960", 12, 3, NULL);
+      p_bind_buf ub2[16] = {0}; ub2[2] = (p_bind_buf){3, 2, (uintptr_t)mem, 4096}; g_mlcb_gw = gpu_saw; subrec_mesh_words(ub2);
+      CHECK(r->m[0].cb_gpu != 0 && r->m[0].gw == gpu_saw && g_mlcb_gw == NULL, "the GPU address of the bound buffer and the GPU copy's slot are recorded, the slot taken once");
+      pw[775] = 0xbad; commit();
+      subrec_mesh_fmt(buf, sizeof buf, r);
+      snprintf(want, sizeof want, "(task uniform words 0xa0 0x5a 0x7 0x1 at +3088 of the buffer bound at guest %#llx, size 4096, Metal GPU %#llx; now 0xa0 0x5a 0x7 0xbad; GPU copy ahead of the draw 0xa0 0x5a 0x7 0x7fffffff)",
+               (unsigned long long)(uintptr_t)mem, (unsigned long long)r->m[0].cb_gpu);
+      CHECK(has(buf, want), "the report prints the words at encode, the memory now and the GPU's copy side by side"); }
+
     // The error path: a failed command buffer prints the record once its submission is closed, once per fence
     r = begin(20); subrec_add("aaaa", "bbbb", &A, 0); uint32_t s0 = subrec_cut(); subrec_add("cccc", "dddd", &B, 0); last = commit();
     CHECK(!subrec_failed(20, s0, error(HANG), 0), "a failed segment waits for its submission's last command buffer");

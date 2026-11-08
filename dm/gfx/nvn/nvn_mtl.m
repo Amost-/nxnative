@@ -1073,10 +1073,18 @@ static void gmem_commit_patch(void);   // the raw pool table words of the argume
 #define SUBREC_LINE 8192   // the longest line a report builds: 48 pairs of two 16-character keys with their pass marks fit with room to spare
 // vs / fs: shader keys (16 hex digits, or a builtin's name cut to 16); cb: the command buffer of the submission it ran in (0 = the first, 255 = that one or later);
 // pass: render passes begun since the submission began when it first ran in that command buffer (65535 = that many or more)
-typedef struct { char vs[17], fs[17]; uint8_t cb; uint16_t pass; } subrec_pair;
+typedef struct { char vs[17], fs[17]; uint8_t cb, pull; uint16_t pass; } subrec_pair;
 // last: the program or compute shader of the previous add (most draws repeat it); cb: the command buffer being encoded (its index in the submission), cb_first: its first entry in p
 // (pairs are kept once per command buffer, so a failed one lists all it ran); pass0: g_stat_pass when the submission began; fb: subrec_failed's state, SUBREC_FB_* bits
-typedef struct { uint64_t fence, frame, pass0; uint32_t draws, dispatches, n, n_more, cb, cb_first; subrec_pair p[SUBREC_PAIRS]; const void *last; _Atomic uint32_t fb; } subrec_t;
+// A task / mesh draw of the submission (subrec_mesh_add), as many as SUBREC_MESH, the rest counted: its three keys, where it ran, and its workgroups: count and first of a direct draw, or for a
+// GPU-written one the converted arguments in the frame arena (args, words 0 and 4), read when the report is printed. Printed after the pipelines when a command buffer fails (issue #1326:
+// the foliage task's draws are in the hung command buffers; their grids tell whether a count ran away)
+#define SUBREC_MESH 24
+// words: with DM_NVN_MESHLOG_CB, four words of the task stage's uniform buffer as the CPU saw them when the draw was encoded (has_words)
+// cb_addr / cb_size / cb_gpu: where that uniform buffer was bound (the guest address of the buffer, its size, the Metal GPU address of it, 0 when no pool holds it); gw: with DM_NVN_MESHLOG_CB_GPU=1, the four
+// words a GPU copy ahead of the draw took from the same place (mesh_tasks_draw), 0xfeedface until that copy ran; cb_state: 1 an update deferred in the pass covers it
+typedef struct { char ts[17], ms[17], fs[17]; uint8_t cb, has_words, cb_state, no_first, ind; uint16_t pass; uint32_t count, first, words[4]; const uint32_t *args; uint64_t cb_addr, cb_gpu; uint32_t cb_size, cb_off; const volatile uint32_t *gw; } subrec_mesh;
+typedef struct { uint64_t fence, frame, pass0; uint32_t draws, dispatches, n, n_more, cb, cb_first, nm, nm_more, pulls; subrec_pair p[SUBREC_PAIRS]; subrec_mesh m[SUBREC_MESH]; const void *last; _Atomic uint32_t fb; } subrec_t;
 static subrec_t g_subrec[SUBREC_RING]; static subrec_t *g_subrec_cur;   // g_subrec_cur: the record draws go to, NULL between mtl_sub_commit and the next mtl_sub_begin
 static _Atomic uint64_t g_cur_frame;   // tentative, as below: the presented frame counter (mtl_set_frame)
 static uint64_t g_stat_pass;   // tentative, as below: render passes begun since launch (the number DM_NVN_PASSDUMP's lines carry)
@@ -1095,6 +1103,35 @@ static void subrec_add(const char *vs, const char *fs, const void *who, int disp
     e->cb = (uint8_t)(r->cb < 255 ? r->cb : 255); uint64_t dp = g_stat_pass - r->pass0; e->pass = (uint16_t)(dp < 65535 ? dp : 65535);
     r->n++;
 }
+static void subrec_mesh_add(const char *ts, const char *ms, const char *fs, uint32_t count, uint32_t first, const uint32_t *args) {
+    subrec_t *r = g_subrec_cur; if (!r) return;
+    if (r->nm == SUBREC_MESH) { r->nm_more++; return; }
+    subrec_mesh *e = &r->m[r->nm++];
+    subrec_key(e->ts, ts, "-"); subrec_key(e->ms, ms, NULL); subrec_key(e->fs, fs, "-");
+    e->cb = (uint8_t)(r->cb < 255 ? r->cb : 255); uint64_t dp = g_stat_pass - r->pass0; e->pass = (uint16_t)(dp < 65535 ? dp : 65535);
+    e->count = count; e->first = first; e->args = args; e->has_words = 0;
+}
+// Diagnostic DM_NVN_MESHLOG_CB=<register>:<byte offset> (off by default): each task / mesh draw the failure report lists also carries the four words at that offset of the task
+// stage's uniform buffer in that register, read on the CPU when the draw is encoded (an update deferred in the pass is not seen). Ocarina of Time's foliage task a5288d0a6c4971fd
+// bounds its occlusion loops by the grid size at c3[193] (register 0, offset 3088): DM_NVN_MESHLOG_CB=0:3088
+static const volatile uint32_t *g_mlcb_gw;   // the GPU copy's words of the draw about to be recorded (mesh_tasks_draw's mlcb_gpu_copy), taken by subrec_mesh_words
+static void subrec_mesh_words(const p_bind_buf *ubo) {
+    static int reg = -2; static uint32_t off;
+    if (reg == -2) { const char *e = getenv("DM_NVN_MESHLOG_CB"); reg = -1; unsigned r, o; if (e && sscanf(e, "%u:%u", &r, &o) == 2 && r < 16) { reg = (int)r; off = o & ~3u; } }
+    subrec_t *r = g_subrec_cur; if (reg < 0 || !r || !r->nm || r->nm > SUBREC_MESH) return;
+    const p_bind_buf *u = &ubo[reg]; subrec_mesh *e = &r->m[r->nm - 1];
+    if (!u->addr || (uint64_t)off + 16 > u->size) return;
+    memcpy(e->words, (const void *)(uintptr_t)(u->addr + off), 16); e->has_words = 1;
+    e->cb_addr = u->addr; e->cb_size = (uint32_t)u->size; e->cb_off = off; e->gw = g_mlcb_gw; g_mlcb_gw = NULL;
+    { void *mb; uint64_t mo, g; if (mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &g)) e->cb_gpu = g; }
+    static int once; if (!once++) MLOG("DM_NVN_MESHLOG_CB: task uniform register %d at byte %u of the first draw (task %s): %#x %#x %#x %#x", reg, off, e->ts, e->words[0], e->words[1], e->words[2], e->words[3]);
+}
+// A draw that went through its pulling stand-in (hybrid pipelines): counted, and its pair in this command buffer marked (vs / fs: the keys as subrec_key makes them, after subrec_add)
+static void subrec_pull(const char *vs, const char *fs) {
+    subrec_t *r = g_subrec_cur; if (!r) return;
+    r->pulls++;
+    for (uint32_t i = r->n; i-- > r->cb_first;) if (!strcmp(r->p[i].vs, vs) && !strcmp(r->p[i].fs, fs)) { r->p[i].pull = 1; return; }
+}
 // A segment of the submission is committed (sub_cut): the draws after it go to the next command buffer. Returns the index of the committed one, which its feedback handler gives
 // back to subrec_failed. Without a record (no submission begun) 0, which subrec_failed cannot match to a fence anyway
 static uint32_t subrec_cut(void) { subrec_t *r = g_subrec_cur; if (!r) return 0; uint32_t k = r->cb++; r->cb_first = r->n; r->last = NULL; return k; }
@@ -1112,20 +1149,42 @@ static int sr_put(char *line, size_t size, int o, const char *fmt, ...) {
 // timestamps (ts_boundary) numbered a segment without committing one
 static int subrec_fmt(char *line, size_t size, int o, const subrec_t *r, uint32_t failed) {
     uint32_t listed = 0;   // the command buffers with an entry, as failed's bits
-    o = sr_put(line, size, o, " fence %llu (frame %llu, %u draws, %u dispatches, %u command buffers, from pass %llu):", (unsigned long long)r->fence, (unsigned long long)r->frame,
+    o = sr_put(line, size, o, " fence %llu (frame %llu, %u draws, %u dispatches, %u command buffers, from pass %llu", (unsigned long long)r->fence, (unsigned long long)r->frame,
                r->draws, r->dispatches, r->cb + 1, (unsigned long long)r->pass0);
+    if (r->pulls) o = sr_put(line, size, o, ", %u draws through a pulling stand-in", r->pulls);
+    o = sr_put(line, size, o, "):");
     for (uint32_t i = 0; i < r->n; i++) {
         const subrec_pair *e = &r->p[i];
         int new_cb = !i || e->cb != r->p[i - 1].cb;
         uint32_t bit = 1u << (e->cb < 29 ? e->cb : 29); listed |= bit;
         if (new_cb) o = sr_put(line, size, o, "%s cb %u%s:", i ? " |" : "", e->cb, failed & bit ? " FAILED" : "");
         if (new_cb || e->pass != r->p[i - 1].pass) o = sr_put(line, size, o, " pass +%u", e->pass);
-        o = sr_put(line, size, o, " %s/%s", e->vs, e->fs);
+        o = sr_put(line, size, o, " %s/%s%s", e->vs, e->fs, e->pull ? "+pull" : "");
     }
     for (uint32_t k = 0; k < 30; k++) if (failed >> k & 1 && !(listed >> k & 1)) o = sr_put(line, size, o, "%s cb %u%s FAILED: none listed", r->n || k ? " |" : "", k, k == 29 ? " or later" : "");
     if (!r->n && !failed) o = sr_put(line, size, o, " no draw or dispatch");
     if (r->n_more) o = sr_put(line, size, o, " (+%u more)", r->n_more);
     return sr_put(line, size, o, ";");
+}
+// The record's task / mesh draws as one line: "[RED] task / mesh draws of the failed submission fence F: cb 0 pass +3 task/mesh/fragment direct 12 from 0, ...". The arena of a
+// GPU-written draw's arguments is still held by the submission while its handlers run
+static const char *subrec_mesh_fmt(char *line, size_t size, const subrec_t *r) {
+    int o = sr_put(line, size, 0, "[RED] task / mesh draws of the failed submission fence %llu (%u%s):", (unsigned long long)r->fence, r->nm + r->nm_more, r->nm_more ? ", the first listed" : "");
+    for (uint32_t i = 0; i < r->nm; i++) { const subrec_mesh *e = &r->m[i];
+        o = sr_put(line, size, o, "%s cb %u pass +%u %s/%s/%s ", i ? "," : "", e->cb, e->pass, e->ts, e->ms, e->fs);
+        if (e->args) { const volatile uint32_t *a = e->args; o = sr_put(line, size, o, "indirect %u", a[0]); if (!e->no_first) o = sr_put(line, size, o, " from %u", a[4]); }
+        else if (e->ind) o = sr_put(line, size, o, "indirect (count not kept)");
+        else o = sr_put(line, size, o, "direct %u from %u", e->count, e->first);
+        if (e->has_words) {
+            o = sr_put(line, size, o, " (task uniform words %#x %#x %#x %#x at +%u of the buffer bound at guest %#llx, size %u, Metal GPU %#llx%s", e->words[0], e->words[1], e->words[2], e->words[3], e->cb_off,
+                       (unsigned long long)e->cb_addr, e->cb_size, (unsigned long long)e->cb_gpu, e->cb_state & 1 ? ", an update deferred in the pass covers it" : "");
+            // the memory now, when the report is printed: a difference from the words above is a write after the draw was encoded; its pool may be gone, then nothing is read
+            void *mb; uint64_t mo;
+            if (e->cb_addr && mtl_addr(e->cb_addr + e->cb_off, 16, &mb, &mo)) { const uint32_t *w = (const uint32_t *)(uintptr_t)(e->cb_addr + e->cb_off);
+                o = sr_put(line, size, o, "; now %#x %#x %#x %#x", w[0], w[1], w[2], w[3]); }
+            if (e->gw) o = sr_put(line, size, o, "; GPU copy ahead of the draw %#x %#x %#x %#x", e->gw[0], e->gw[1], e->gw[2], e->gw[3]);
+            o = sr_put(line, size, o, ")"); } }
+    return line;
 }
 // A failed command buffer of a submission, from its feedback handler: once all of the submission's command buffers are committed (its last one's handler has run, last = 1) and one
 // of its own failed, the record is printed, once per fence and for the first SUBREC_REPORTS fences. Every handler of the last command buffer calls it, failed or not, to close the
@@ -1146,7 +1205,9 @@ static int subrec_failed(uint64_t fence, uint32_t cb, NSError *err, int last) {
     char *line = malloc(SUBREC_LINE); if (!line) return 0;
     int o = sr_put(line, SUBREC_LINE, 0, "[RED] pipelines of the failed submission (vertex/fragment pairs and -/compute, per command buffer in the order they first ran):");
     subrec_fmt(line, SUBREC_LINE, o, r, now & ((1u << SUBREC_FB_CBS) - 1));
-    MLOG("%s", line); free(line);
+    MLOG("%s", line);
+    if (r->nm) { MLOG("%s", subrec_mesh_fmt(line, SUBREC_LINE, r)); }
+    free(line);
     return 1;
 }
 #define WD_SLICE_MS 2000ull   // a blocking wait is cut into slices of this length so the watchdog can look between them
@@ -11828,7 +11889,7 @@ static int mdi_live(uint64_t cnt, int i) { return (uint32_t)i < mdi_count(cnt); 
 // (Kamura Village draws the same records with two counts between the same writes: keyed by the record alone, the second multi-draw found no copy and waited for the GPU each frame)
 #define MDX_SLOTS 16384   // a power of two; a scan fills at most a quarter
 static const p_multi_draw *g_mdx_range;   // only while replaying a compact range through the GPU mask
-typedef struct { uint64_t ind, cnt, out, tag; } mdx_ent;   // out: GPU address of the copy, 0 when the record or count is in no Metal buffer (those draws wait, mdi_live)
+typedef struct { uint64_t ind, cnt, out, tag; const uint32_t *cpu; } mdx_ent;   // out: GPU address of the copy, 0 when the record or count is in no Metal buffer (those draws wait, mdi_live)
 static mdx_ent g_mdx[MDX_SLOTS]; static int g_mdx_n; static uint64_t g_mdx_tag = 1, g_mdx_ep = ~0ull, g_mdx_sub, g_mdx_runs, g_mdx_splits, g_mdx_draws, g_mdx_fast; static const uint8_t *g_mdx_stop;
 // The kernel mdx_mask: dm/gfx/msl/mdx.metal
 static int mdx_wanted(const p_draw *dw, const p_draw_idx *di) { return dw ? dw->mdi_cnt && !ixc_wanted(dw, NULL) : di->mdi_cnt && !ixc_wanted(NULL, di); }
@@ -11840,6 +11901,7 @@ static int mdx_find(uint64_t ind, uint64_t cnt, uint64_t *out) {   // → 1 when
     const mdx_ent *e = mdx_slot(ind, cnt); if (e->tag != g_mdx_tag) return 0;
     *out = e->out; return 1;
 }
+static const uint32_t *mdx_cpu(uint64_t ind, uint64_t cnt) { const mdx_ent *e = mdx_slot(ind, cnt); return e->tag == g_mdx_tag ? e->cpu : NULL; }   // the copy mdx_find found, as the CPU sees it
 static void mdx_run(const p_draw *dw, const p_draw_idx *di) {
     static id<MTLComputePipelineState> ps; static id<MTL4ArgumentTable> at; static int failed;
     if (failed) return;
@@ -11851,7 +11913,7 @@ static void mdx_run(const p_draw *dw, const p_draw_idx *di) {
     enum { QMAX = MDX_SLOTS / 4 };
     static struct { mdx_ent *e; uint32_t i, words; } q[QMAX]; int nq = 0;
     uint64_t lo = ~0ull, hi = 0;   // the hull of the records and counts taken, for the uniform update check
-    #define MDX_TAKE(IND, CNT, I, W) do { mdx_ent *e_ = mdx_slot((IND), (CNT)); if (e_->tag != g_mdx_tag && nq < QMAX) { *e_ = (mdx_ent){(IND), (CNT), 0, g_mdx_tag}; g_mdx_n++; \
+    #define MDX_TAKE(IND, CNT, I, W) do { mdx_ent *e_ = mdx_slot((IND), (CNT)); if (e_->tag != g_mdx_tag && nq < QMAX) { *e_ = (mdx_ent){(IND), (CNT), 0, g_mdx_tag, NULL}; g_mdx_n++; \
         q[nq].e = e_; q[nq].i = (uint32_t)(I); q[nq++].words = (W); lo = MIN(lo, MIN((IND), (CNT))); hi = MAX(hi, MAX((IND) + 4 * (W), (CNT) + 4)); } } while (0)
     if (dw && dw->prim == DM_PRIM_MESH_TASKS) MDX_TAKE(dw->ind, dw->ind, 0, 0); else if (dw) MDX_TAKE(dw->ind, dw->mdi_cnt, dw->mdi_i, 4); else MDX_TAKE(di->ind, di->mdi_cnt, di->mdi_i, 5);   // words 0: an indirect mesh draw, keyed by its record alone
     if (g_mdx_range) {
@@ -11885,7 +11947,7 @@ static void mdx_run(const p_draw *dw, const p_draw_idx *di) {
     memset(j, 0, (size_t)nj * sizeof(mjob));
     for (int k = 0; k < nq; k++) { mdx_ent *e = q[k].e; void *mb; uint64_t mo, rg, cg;
         if (!mtl_gpu_addr(e->ind, 4 * (q[k].words ? q[k].words : 2), &mb, &mo, &rg) || !mtl_gpu_addr(e->cnt, 4, &mb, &mo, &cg)) continue;
-        e->out = og + 32 * (uint64_t)k; j[k] = (mjob){rg, cg, e->out, q[k].i, q[k].words}; }
+        e->out = og + 32 * (uint64_t)k; e->cpu = (const uint32_t *)((const uint8_t *)ab.contents + ao + (size_t)nj * sizeof(mjob) + 32 * (size_t)k); j[k] = (mjob){rg, cg, e->out, q[k].i, q[k].words}; }
     id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL); [ce setArgumentTable:at]; [at setAddress:ab.gpuAddress + ao atIndex:0]; [ce setComputePipelineState:ps];
     [ce dispatchThreadgroups:MTLSizeMake((NSUInteger)nj / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     enc_c_end(ce);
@@ -12323,7 +12385,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     if (ps != g_enc_pso) { enc_r_pso(en, ps); g_enc_pso = ps; }
     if (g_subrec_cur && g_subrec_cur->last != (__bridge const void *)pr) {   // GPU hang watchdog: the pipelines of this submission (a repeated program costs one compare)
         char vk[17], fk[17]; subrec_key(vk, pr->sh[0] ? pr->sh[0]->key : NULL, pr->sh[0] ? pr->sh[0]->builtin : NULL); subrec_key(fk, pr->sh[1] ? pr->sh[1]->key : NULL, pr->sh[1] ? pr->sh[1]->builtin : "-");
-        subrec_add(vk, fk, (__bridge const void *)pr, 0); }
+        subrec_add(vk, fk, (__bridge const void *)pr, 0); if (cur_pull && !g_geo_mesh.on) subrec_pull(vk, fk); }
     else if (g_subrec_cur) g_subrec_cur->draws++;
     if (g_sm_pass && g_sm_applied != g_sm_cur) {   // the layer this draw goes to (see g_sm_plan)
         MTLVertexAmplificationViewMapping vm = {0, (uint32_t)(g_sm_cur - g_sm_lo)}; [(id<MTL4RenderCommandEncoder>)en setVertexAmplificationCount:1 viewMappings:&vm]; g_sm_applied = g_sm_cur; }

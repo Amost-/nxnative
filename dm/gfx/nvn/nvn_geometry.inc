@@ -603,6 +603,24 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
 // DrawMeshTasksIndirect: {count, first}, which the game's culling writes earlier in the submission, while Metal's indirect mesh draw takes {x, y, z}. mdx_run copies the count to a {count, 1, 1} on the
 // GPU, before the render pass and for every such draw up to the next write, and the shader reads first from the record. Reading the record on the CPU instead took a wait for the GPU at each hazard:
 // 73 % of the submit thread in Ocarina of Time's Kokiri Forest, frames of 90 ms and more against 25 ms of GPU work
+// Diagnostic DM_NVN_MESHLOG_CB_GPU=1 (with DM_NVN_MESHLOG_CB, off by default): what the GPU reads, not what the CPU holds. Before a task draw the render pass is ended and the same four words are copied
+// in queue order into a host buffer (one slot per record and draw, set to 0xfeedface first, so a copy that never ran shows), which the failure report prints beside the CPU's. It splits the pass
+// at every task draw, so it can change what hangs: use it to see the value, not to count hangs. The slot is handed to subrec_mesh_words (g_mlcb_gw)
+static void mlcb_gpu_copy(NvShader *ts) {
+    static int on = -1, reg = -1; static uint32_t off; static __strong id<MTLBuffer> buf;
+    if (on < 0) { const char *g = getenv("DM_NVN_MESHLOG_CB_GPU"), *e = getenv("DM_NVN_MESHLOG_CB"); unsigned r, o; on = g && atoi(g) && e && sscanf(e, "%u:%u", &r, &o) == 2 && r < 16;
+        if (on) { reg = (int)r; off = o & ~3u; buf = [g_dev newBufferWithLength:(size_t)SUBREC_RING * SUBREC_MESH * 16 options:MTLResourceStorageModeShared]; if (buf) res_add(buf); else on = 0;   // res_add: a buffer a command writes must be in the residency set
+            MLOG("DM_NVN_MESHLOG_CB_GPU: the task stage's register %d at byte %u is copied by the GPU before each task draw (the render pass is split there)", reg, off); } }
+    g_mlcb_gw = NULL;
+    subrec_t *r = g_subrec_cur; if (!on || !ts || !r || r->nm >= SUBREC_MESH) return;
+    const p_bind_buf *u = &S.ubo[3][reg]; void *mb; uint64_t mo;
+    if (!u->addr || (uint64_t)off + 16 > u->size || !mtl_addr(u->addr + off, 16, &mb, &mo) || (g_nubd && ubd_hits(u->addr + off, u->addr + off + 16))) return;
+    uint32_t *slot = (uint32_t *)buf.contents + ((size_t)(r - g_subrec) * SUBREC_MESH + r->nm) * 4;
+    slot[0] = slot[1] = slot[2] = slot[3] = 0xfeedface;
+    rp_end();
+    enc_b_copy_buffer(blit_buf(u->addr + off, u->addr + off + 16, 0, 0), (__bridge id<MTLBuffer>)mb, (NSUInteger)mo, buf, (NSUInteger)((uint8_t *)slot - (uint8_t *)buf.contents), 16);
+    g_mlcb_gw = slot;
+}
 static void mesh_tasks_draw(const p_draw *dw) {
     if (!S.prog || (!dw->ind && dw->count <= 0)) return;
     // Diagnostic DM_NVN_SKIP_MESH=1 (off by default): drops every task / mesh draw, as DM_NVN_SKIP_FS drops draws by fragment shader, to measure what they cost in all (the picture is wrong)
@@ -614,6 +632,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
         RED_ONCE(150, "DrawMeshTasks without its task and mesh shaders (task %s mesh %s): draw skipped", ts ? ts->key : "-", ms ? ms->key : "-"); return; }
     image_prepare(pr, 1u << 3 | 1u << 4);
     if (g_nubd && (g_enc || ubd_lazy()) && ((ts && ubd_conflict_sh(ts, 3)) || ubd_conflict_sh(ms, 4))) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // as draw_ does for its stages
+    mlcb_gpu_copy(ts);   // DM_NVN_MESHLOG_CB_GPU
     NvProg *raster = pr->geo_lean_raster;   // the pixel stage alone
     if (!raster || raster->sh[1] != pr->sh[1] || raster->sh[0]) { raster = [NvProg new]; raster->sh[1] = pr->sh[1]; pr->geo_lean_raster = raster; }
     uint64_t ind = 0, ind_first = 0;
@@ -628,6 +647,11 @@ static void mesh_tasks_draw(const p_draw *dw) {
     draw_(&triangle, NULL);
     g_geo_program = nil; g_mtk.on = 0; args_dirty_all();
     if (g_mtk.miss) { g_mtk_wait++; return; }
+    // named if the command buffer fails (subrec_mesh_fmt): a direct draw's grid, a GPU-written one's count as the copy mdx_run made holds it when the report prints
+    subrec_mesh_add(ts ? ts->key : NULL, ms->key, pr->sh[1] ? pr->sh[1]->key : NULL, (uint32_t)dw->count, (uint32_t)dw->first, ind ? mdx_cpu(dw->ind, dw->ind) : NULL);
+    if (g_subrec_cur && g_subrec_cur->nm && g_subrec_cur->nm_more == 0) { subrec_mesh *me = &g_subrec_cur->m[g_subrec_cur->nm - 1]; me->no_first = 1; me->ind = dw->ind != 0;   // the copy holds {count, 1, 1}
+        if (ts) { subrec_mesh_words(S.ubo[3]);   // DM_NVN_MESHLOG_CB
+            if (me->has_words && g_nubd && ubd_hits(me->cb_addr + me->cb_off, me->cb_addr + me->cb_off + 16)) me->cb_state |= 1; } }   // an update deferred in the pass: the GPU reads its shadow, not these words
     swrite_note(pr); g_wr_epoch++;
     if (!g_mtk_n++) MLOG("task / mesh: first draw, task %s mesh %s fragment %s, %u workgroups from %u%s", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", g_mtk.count, g_mtk.first, ind ? " (indirect)" : "");
 }
