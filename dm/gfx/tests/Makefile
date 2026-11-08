@@ -218,6 +218,11 @@ t_ub: t_ub.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_ub.m $(MTL_T_SRC) $(FW)
 t_gpuprof: t_gpuprof.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_gpuprof.m $(MTL_T_SRC) $(FW)
+t_mlcb_gpu: t_mlcb_gpu.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_mlcb_gpu.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_mlcb_gpu
+check_t_mlcb_gpu: t_mlcb_gpu
+	@MTL_DEBUG_LAYER=1 ./t_mlcb_gpu
 t_vbuf: t_vbuf.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_vbuf.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_vbuf
