@@ -12,7 +12,7 @@ module_t *module_of(const void *p) { (void)p; return NULL; }
 module_t *g_mod; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
-extern int t_hdr_screen; extern unsigned t_hdr_lo, t_hdr_hi;
+extern int t_hdr_screen; extern unsigned t_hdr_lo, t_hdr_hi; extern float t_hdr_headroom;
 int vi_hdr_answered(void); int dm_hdr_mode(void); void dm_hdr_set_mode(int m);
 static int checks, failed;
 #define CHECK(name, ok) do { int pass_ = !!(ok); checks++; failed += !pass_; printf("%s: %s\n", name, pass_ ? "PASS" : "FAIL"); } while (0)
@@ -137,6 +137,30 @@ int main(void) { @autoreleasepool {
         t_hdr_screen = 0; dm_hdr_set_mode(2); status(&on, &fmt, &peak, NULL);
         CHECK("mode 2 (DM_HDR=2): HDR on a screen without EDR too", on == 1 && fmt == 1);
         dm_hdr_set_mode(1); t_hdr_screen = 1;
+    }
+
+    // The peak (the HDR peak row): a number as it is; DM_HDR_PEAK=auto, the paper white (203) times the screen's current headroom, rounded to 10 nits, never below the paper white
+    // and at most 16 bits; SDR still answers peak 0. DM_HDR_PEAK is read at every query, so the cases can follow one another
+    {
+        uint8_t on = 9; uint32_t fmt = 9; uint16_t peak = 9;
+        setenv("DM_HDR_PEAK", "1600", 1); status(&on, &fmt, &peak, NULL);
+        CHECK("DM_HDR_PEAK=1600: peak 1600", on == 1 && peak == 1600);
+        setenv("DM_HDR_PEAK", "auto", 1);
+        t_hdr_headroom = 3.5f; status(&on, &fmt, &peak, NULL);
+        CHECK("automatic, headroom 3.5: peak 710 (203 × 3.5 = 710.5, to 10 nits)", on == 1 && fmt == 1 && peak == 710);
+        t_hdr_headroom = 16.0f; status(&on, &fmt, &peak, NULL);
+        CHECK("automatic, headroom 16 (the XDR panel's potential headroom): peak 3250", peak == 3250);
+        t_hdr_headroom = 1.0f; status(&on, &fmt, &peak, NULL);
+        uint16_t p1 = peak; t_hdr_headroom = 0.5f; status(&on, &fmt, &peak, NULL);
+        uint16_t p05 = peak; t_hdr_headroom = NAN; status(&on, &fmt, &peak, NULL);
+        CHECK("automatic, headroom 1, 0.5 or not a number: the paper white, rounded up (203 → 203)", p1 == 203 && p05 == 203 && peak == 203);
+        t_hdr_headroom = 1000.0f; status(&on, &fmt, &peak, NULL);
+        CHECK("automatic, a headroom past 16 bits (203 × 1000): peak 65535", peak == 65535);
+        t_hdr_headroom = 2.0f; t_hdr_screen = 0; status(&on, &fmt, &peak, NULL);
+        CHECK("automatic on a screen without EDR: SDR, peak 0", on == 0 && peak == 0);
+        t_hdr_screen = 1; t_hdr_headroom = 1.0f; unsetenv("DM_HDR_PEAK");
+        status(&on, &fmt, &peak, NULL);
+        CHECK("unset again: peak 1000", peak == 1000);
     }
 
     const double nits[N] = {0, 0.1, 10, 80, 203, 500, 1000, 10000};

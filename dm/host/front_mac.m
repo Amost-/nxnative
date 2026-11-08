@@ -36,7 +36,15 @@ static CAMetalLayer *g_layer;
 // Read four times a second on the main thread while the HDR layer is on, so it follows the window to another screen (an external SDR monitor beside the built-in XDR screen)
 static _Atomic int g_hdr_screen = -1;
 int front_hdr_screen(void) { return atomic_load(&g_hdr_screen) != 0; }
+// The screen's current EDR headroom (maximumExtendedDynamicRangeColorComponentValue), read with the potential one: hle_vi.c's automatic peak (DM_HDR_PEAK=auto) is the paper white times it.
+// 1.0 until the first read and without the HDR layer. The system grants the headroom while the window is in front, whatever range the game declares, so the automatic peak does not
+// hold itself down: on the XDR panel it read 1.2 when the layer was made and 16 by the game's first query, then followed the brightness slider both ways (16 at low brightness,
+// 3.2 = 1600 / 500 nits at full). In a window behind others it stays at 1.2 with any declared range. Polled, as the system offers no notification for it; the game asks every frame,
+// so a change reaches it within a quarter second
+static _Atomic float g_hdr_headroom = 1.0f;
+float front_hdr_headroom(void) { return atomic_load(&g_hdr_headroom); }
 static void front_hdr_screen_read(NSScreen *s) {
+    atomic_store(&g_hdr_headroom, (float)s.maximumExtendedDynamicRangeColorComponentValue);
     double pot = s.maximumPotentialExtendedDynamicRangeColorComponentValue;
     int can = pot > 1.0;
     if (atomic_exchange(&g_hdr_screen, can) != can) LOG("front end: the window's screen %s EDR (%s, potential headroom %.2f)", can ? "can show" : "cannot show", s.localizedName.UTF8String, pot);

@@ -23,7 +23,9 @@ DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX	game	DM_GAME_UPSCALER_N!=0	Ga
 DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
 DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
 DM_PICTURE_FIT	choice	fit=Fit,fill=Fill	fit	platform:ios	Game	Picture	Fill crops the game's 16:9 picture to cover the screen. Health bars, subtitles or maps near the edges can be cut off. A full-screen picture without cropping needs a patch for each game.
-DM_HDR	toggle	-	0	switch2	Game	HDR output
+DM_HDR	toggle	-	0	switch2	Game	HDR output	Takes effect on a screen with HDR headroom; an SDR screen keeps SDR.	level=basic
+DM_HDR_PAPER_WHITE	choice	120=120 nits,160=160 nits,203=203 nits (standard),250=250 nits,300=300 nits,400=400 nits	203	switch2	Game	HDR paper white		level=basic;needs=DM_HDR=1
+DM_HDR_PEAK	choice	auto=Automatic?platform:mac,400=400 nits,600=600 nits,1000=1000 nits (standard),1600=1600 nits	1000	switch2	Game	HDR peak		level=basic;needs=DM_HDR=1
 DM_SHOW_FPS	toggle	-	build:DM_SHOW_FPS	platform:ios	Game	Frame-rate counter
 DM_TOUCH_HAPTICS	toggle	-	1	platform:ios	Controls	Touch feedback
 DM_RUMBLE	toggle	-	1	always	Controls	Game rumble		level=basic

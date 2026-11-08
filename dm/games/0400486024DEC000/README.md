@@ -70,6 +70,7 @@ With the HDR output setting, on the Mac app to the opening movie (M4 Pro, macOS 
 - Like [Donkey Kong Bananza](../040074A01BF12000/README.md#hdr-output), the game boots an RGBA8 window (format 0x25, 2560x1440), queries `vi::QueryDisplayHdrStatus`, then makes an RGB10A2 window (0x3d). It asks every frame (1,000 queries in 38 s) and queries the paper white (203 nits).
 - It declares SDR 0 to 203 nits and extended 0 to 710, gamut 0 and tone mapping 0. No new `[RED]` line with HDR on.
 - On an LG HDR 4K monitor with HDR off in macOS (potential headroom 1.00), `DM_HDR=1` answered SDR and the game kept its RGBA8 window. `DM_HDR=2` (HDR on any screen) made it switch. Not run on a screen with EDR, and the picture was not compared between the modes.
+- On a MacBook Pro's XDR panel (M2 Pro, macOS 27.2, potential headroom 16, 2026-11-06) the player judged HDR to work and its intensity right. The declared extended range is min(peak, 3.5 × paper white): `DM_HDR_PEAK=400` gave 0..400, `DM_HDR_PEAK=1600` 0..710, and `DM_HDR_PAPER_WHITE=300` 0..1000 (its standard range 0..300). So the paper white also raises the highlights, and the peak counts only below 3.5 times it. With [HDR peak](../../../docs/settings.md#hdr-peak) Automatic the peak follows the screen's current headroom, which changes this game's range only while the headroom is under 3.5.
 
 ## Open
 

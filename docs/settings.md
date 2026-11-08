@@ -3,7 +3,7 @@
 The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
 
 - [Tested defaults](#tested-defaults)
-- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [HDR output](#hdr-output), [Frame-rate counter](#frame-rate-counter)
+- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [HDR output](#hdr-output), [HDR paper white](#hdr-paper-white), [HDR peak](#hdr-peak), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
@@ -82,6 +82,14 @@ iPhone and iPad. **Fit**, the default, shows the game's picture (16:9, or the ta
 ### HDR output
 
 Shown for Switch 2 games, on the Mac and the iPhone (measured on Donkey Kong Bananza and, to its title screen, Mario Kart World; the other Switch 2 titles are untested). **On** starts the game with its own HDR output: on a screen with HDR headroom, whites stay at the screen's normal white and the picture's highlights can go brighter above it; on a screen that cannot show HDR (most external monitors) the game is told so and shows its own SDR picture, and moving the window between screens switches it (Mario Kart World). **Off**, the default, keeps the picture as SDR. On the iPhone and iPad the in-game menu turns it on and off while the game runs (the game changes its picture within a frame or two); on the Mac it applies from the next start.
+
+### HDR paper white
+
+Shown under **HDR output** while it is on. How bright the game draws its normal white, and so everything that is not a highlight. **203 nits (standard)**, the default, is the reference level HDR video uses. A higher value brightens the whole picture, as a console's HDR brightness calibration does. It also lifts the highlights: Ocarina of Time lets its brightest highlights reach 3.5 times the paper white (710 nits at 203), within the limit [HDR peak](#hdr-peak) sets. A lower value suits a dim room.
+
+### HDR peak
+
+Shown under **HDR output** while it is on. The brightest level the game is told the screen can show, which it keeps its highlights within. **1000 nits (standard)** is the default. **Automatic**, on the Mac, follows the screen: the paper white times how many times brighter than white the screen can go at the moment (its headroom). That headroom shrinks as the brightness slider goes up, so with Automatic the game fits its highlights into what the screen can show at the current brightness, instead of macOS compressing a fixed range. The game itself may stop lower: Ocarina of Time never goes past 3.5 times the paper white, so at 203 nits a peak above 710 changes nothing there, and Automatic changes its picture only at high screen brightness. On a MacBook Pro's XDR screen that is only at full brightness, where it lowers Ocarina of Time's highlights from 710 to 650 nits.
 
 ### Picture shape
 

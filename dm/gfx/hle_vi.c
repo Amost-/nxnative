@@ -3,6 +3,7 @@
 #include "../host/hle.h"
 #include <math.h>
 #include <stdatomic.h>
+#include <time.h>
 
 static struct { uint32_t magic; } g_display = {0x50534944}, g_layer = {0x5259414c};
 static struct { uint32_t magic; void *layer; } g_native = {0x4e49574e, 0};
@@ -125,7 +126,7 @@ HLE_FORCE("_ZN2nn2vi8FinalizeEv", "display service shutdown; the host has no vi 
 // game takes its HDR path (its window becomes HDR10: RGB10A2 with PQ values in BT.2020). On a screen without EDR it reports SDR, and the game keeps its own SDR picture.
 // The HDR layer takes the PQ window as it is (dm_hdr_layer_float below); Core Animation maps it into the screen's headroom by the layer's HDR10 metadata (front_mac.m, front_ios.m)
 // The format is 1 with HDR on and 0 with it off: the SDK's own answer is on = (format == 1), and a format above 1 is an error, 0x272 (Donkey Kong Bananza v458752,
-// nn::vi::detail::DefaultDisplay::QueryHdrStatus, sdk+0x55bd60; found in pull request #1249). The peak (DM_HDR_PEAK, default 1000) is the extended luminance range the game declares (its metadata call, below). Neither it nor the paper white has a launcher setting: they are what a console's HDR calibration would set
+// nn::vi::detail::DefaultDisplay::QueryHdrStatus, sdk+0x55bd60; found in pull request #1249). The peak (DM_HDR_PEAK, default 1000) is the extended luminance range the game declares (its metadata call, below). It and the paper white are the launcher's HDR peak and HDR paper white rows: what a console's HDR calibration would set
 // Donkey Kong Bananza boots its SDR window (0x25), queries the status, then makes an RGB10A2 window (0x3d) of PQ code values with SDR white at 203 nits.
 // Neither it nor Mario Kart World imports the SDK's HDR status event (CreateHdrStatusEvent and the rest), so a game learns of another screen only by asking again: the queries are counted in the log
 // A decimal number, clamped to 16 bits (the answers are 16-bit)
@@ -152,10 +153,30 @@ static int vi_hdr_on(void) { return dm_hdr_mode() && dm_sdk_ounce(); }
 __attribute__((weak)) int front_hdr_screen(void) { return 1; }
 // The game's declared extended luminance range in nits, for the HDR layer's HDR10 metadata (front_mac.m and front_ios.m): Core Animation maps the picture into the screen's headroom by it; none without a front end
 __attribute__((weak)) void front_hdr_content_range(unsigned lo, unsigned hi) { (void)lo; (void)hi; }
+// The window's screen's current EDR headroom (front_mac.m: NSScreen.maximumExtendedDynamicRangeColorComponentValue, read four times a second beside the potential headroom):
+// how many times the SDR white the screen can show right now, which falls as the brightness slider rises and depends on the screen's mode. 1.0 without a front end
+// (a windowless run) and on the iPhone, whose front end does not read it: the automatic peak is then the paper white
+__attribute__((weak)) float front_hdr_headroom(void) { return 1.0f; }
 // The paper white in nits, read once (the present and the front ends take it from here too; nvn_mtl.m present_paper_white): a number from 1 to 65535, else 203
 static float vi_paper_white_v;
 static void vi_paper_white_read(void) { const char *e = getenv("DM_HDR_PAPER_WHITE"); double v = e && *e ? strtod(e, NULL) : 203.0; vi_paper_white_v = (v >= 1.0 && v <= 65535.0) ? (float)v : 203.0f; }
 float dm_hdr_paper_white(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, vi_paper_white_read); return vi_paper_white_v; }   // pthread_once: every guest thread sees the value written before
+// The peak the status query answers, in nits. DM_HDR_PEAK=<n> is that number (16-bit, default 1000), read at every query as before. DM_HDR_PEAK=auto (the HDR peak row's Automatic)
+// is the paper white × the screen's current headroom: what the screen can show above SDR white right now, so the range the game declares follows the brightness slider and the
+// screen's reference modes, and the game tone-maps its highlights into it instead of Core Animation compressing a fixed range. Ocarina of Time declares min(peak, 3.5 × paper white)
+// (DM_HDR_PEAK=400 → 0..400, 1600 → 0..710, DM_HDR_PAPER_WHITE=300 → 0..1000), so the automatic peak changes its picture only while the headroom is below 3.5.
+// Rounded to 10 nits, so the slow drift of the headroom (auto-brightness) does not change the answer at every read; never below the paper white (a headroom under 1.0, or not yet
+// granted, still leaves SDR white its own level) and at most 65535 (the answer is 16-bit). *automatic says which it was, for the log
+static uint32_t vi_hdr_peak(int *automatic) {
+    const char *e = getenv("DM_HDR_PEAK");
+    *automatic = e && !strcmp(e, "auto");
+    if (!*automatic) return vi_env_u32("DM_HDR_PEAK", 1000);
+    float pw = dm_hdr_paper_white(), h = front_hdr_headroom();
+    double v = isfinite(h) && h > 1.0f ? (double)pw * h : (double)pw;   // NaN or under 1: the paper white
+    v = round(v / 10.0) * 10.0;
+    if (v < pw) v = ceil(pw);
+    return v > 65535.0 ? 65535u : (uint32_t)v;
+}
 // The HDR layer of both front ends (front_mac.m, front_ios.m): RGB10A2 in BT.2100 PQ, which takes the game's HDR10 window as it is, unless DM_HDR_LAYER=float: the RGBA16Float extended linear
 // BT.2020 layer it replaced, which showed black blocks over flat areas on a MacBook Air M5 (docs/reference/rendering.md, the status query and the present for an HDR window)
 int dm_hdr_layer_float(void) { const char *e = getenv("DM_HDR_LAYER"); return e && !strcmp(e, "float"); }
@@ -170,7 +191,7 @@ HLE_FORCE("_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7Di
     if (!mode && !atomic_load(&g_vi_hdr_live)) { if (on) *on = 0; if (fmt) *fmt = 0; if (peak) *peak = 0; return RES_OK; }   // off from the start: SDR, not logged
     // DM_HDR=2 answers HDR whatever the screen: on a screen without headroom Core Animation maps the HDR picture down instead of the game drawing its own SDR one (on Mario Kart World, more saturated than its SDR)
     int forced = mode == 2, hdr = mode && (forced || front_hdr_screen() != 0);
-    uint32_t p = vi_env_u32("DM_HDR_PEAK", 1000);
+    int automatic; uint32_t p = vi_hdr_peak(&automatic);
     // Logged when the answer changes, and at the 1st, 2nd, 10th, 100th and 1000th query: whether the game asks again (and so can follow the window to another screen)
     static atomic_int queries, last = -1;
     int n = atomic_fetch_add(&queries, 1) + 1, was = atomic_exchange(&last, hdr);
@@ -178,6 +199,22 @@ HLE_FORCE("_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7Di
         LOG("[nvn2-hdr] vi::QueryDisplayHdrStatus (query %d): %s", n, hdr ? (forced && !front_hdr_screen() ? "HDR on, format 1 (DM_HDR=2: on a screen without EDR)" : "HDR on, format 1")
             : mode ? "SDR (DM_HDR is on, but the window's screen cannot show EDR)" : "SDR (HDR output turned off while the game runs)");
     if (hdr) atomic_store(&g_vi_hdr_answered, 1);
+    // The automatic peak (DM_HDR_PEAK=auto) is logged when the answer differs from the last one logged and a second has passed since that line: the settled value of a brightness
+    // ramp is logged within a second of the ramp's end (the game asks every frame), and the answers between are counted rather than written
+    static _Atomic uint32_t peak_last, peak_logged; static _Atomic int64_t peak_logged_at; static atomic_int peak_changes;
+    if (hdr && automatic) {
+        if (atomic_exchange(&peak_last, p) != p) atomic_fetch_add(&peak_changes, 1);
+        if (p != atomic_load(&peak_logged)) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000, at = atomic_load(&peak_logged_at);
+            if ((at == 0 || now - at >= 1000) && atomic_compare_exchange_strong(&peak_logged_at, &at, now)) {   // one thread logs when two ask at once
+                uint32_t was_p = atomic_exchange(&peak_logged, p); int c = atomic_exchange(&peak_changes, 0);
+                if (!was_p) LOG("[nvn2-hdr] vi::QueryDisplayHdrStatus: peak %u nits (automatic: paper white %.0f × the screen's headroom %.2f)", p, dm_hdr_paper_white(), front_hdr_headroom());
+                else LOG("[nvn2-hdr] vi::QueryDisplayHdrStatus: peak now %u nits (automatic: the screen's headroom %.2f; was %u, %d answer%s since that line)",
+                         p, front_hdr_headroom(), was_p, c, c == 1 ? "" : "s");
+            }
+        }
+    }
     if (on) *on = (uint8_t)hdr; if (fmt) *fmt = (uint32_t)hdr; if (peak) *peak = hdr ? (uint16_t)p : 0; return RES_OK; }
 HLE_FORCE("_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE", "display HDR paper white: 203 nits (BT.2408) unless DM_HDR_PAPER_WHITE", Result, h_vi_PaperWhite, uint16_t *nits, const void *disp) {
     (void)disp; uint16_t v = vi_hdr_on() ? (uint16_t)lroundf(dm_hdr_paper_white()) : 203;   // dm_hdr_paper_white is 1 to 65535, so the cast is in range; 203 while HDR is off, as before
