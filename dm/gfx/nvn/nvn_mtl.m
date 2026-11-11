@@ -2244,14 +2244,22 @@ static int ups_demoted(const tex_t *t) {
 // The same game needs short 2D arrays scaled as well (nvn_ups_shape_ok): its G-buffer pass draws into layers of 1600x900 arrays beside 2D targets, and with the arrays left out
 // the mixed-pass rule demoted every target of the pass, so nothing of the 3D stayed scaled
 // Whether an image-shaped texture's storage has another live description of another size and the same format: an alias family (image_texture), whose members share one placement
-// heap so a write through one size is seen through the others (Luigi's Mansion 3's resolution families). A scaled member could not join it, so a family stays at the game's size
-static int ups_family(const tex_t *t) {
+// heap so a write through one size is seen through the others (Luigi's Mansion 3's resolution families; a game with dynamic resolution describes each render target at every size
+// it may take: Bayonetta Origins' 13 scene targets of 1600x900 are all such families). A family is scaled as a whole or not at all, so its members keep sharing one heap, made for
+// the scaled sizes (image_texture): the answer is the one its largest live description gets from the size and flag rule, returned in *scale, so a small member of a screen-sized
+// family is scaled with it and a family whose largest member is no screen-like target stays whole at the game's size. The largest description is live before any member is used
+// (the comment at g_image_desc), so every member gets the same answer
+static int ups_family(const tex_t *t, int depth, int *scale) {
+    *scale = 0;
     if (!image_shape(t)) return 0;
-    int fam = 0;
+    int fam = 0; uint32_t lw = t->d.width, lh = t->d.height;
     pthread_mutex_lock(&g_smu);
-    for (uint32_t i = 0; i < g_image_desc.cap && !fam; i++) { const tex_t *o = g_image_desc.vals[i];
-        fam = o && o->pool == t->pool && o->off == t->off && o->d.format == t->d.format && (o->d.width != t->d.width || o->d.height != t->d.height); }
+    for (uint32_t i = 0; i < g_image_desc.cap; i++) { const tex_t *o = g_image_desc.vals[i];
+        if (!o || o->pool != t->pool || o->off != t->off || o->d.format != t->d.format) continue;
+        fam |= o->d.width != t->d.width || o->d.height != t->d.height;
+        if ((uint64_t)o->d.width * o->d.height > (uint64_t)lw * lh) { lw = o->d.width; lh = o->d.height; } }
     pthread_mutex_unlock(&g_smu);
+    if (fam) *scale = nvn_ups_size_flags_ok(lw, lh, t->d.flags, depth, g_ups);
     return fam;
 }
 static int ups_pick(const tex_t *t, MTLTextureDescriptor *d) {
@@ -2261,8 +2269,9 @@ static int ups_pick(const tex_t *t, MTLTextureDescriptor *d) {
     if (d.depth > 1 || !(d.usage & MTLTextureUsageRenderTarget)) return 0;
     int depth = (int)d.pixelFormat >= 250 && (int)d.pixelFormat <= 262;   // Depth16Unorm … X24_Stencil8, as tex_init_fill
     // Flags, screen-like size and the 4K ceiling (nvn_ups.h, unit-tested in tests/t_ups.c): a render target is COMPRESSIBLE (or DISPLAY: the window's), a plain one is data copied in
-    if (!nvn_ups_size_flags_ok((uint32_t)d.width, (uint32_t)d.height, t->d.flags, depth, g_ups)) return 0;
-    return !ups_family(t);   // last: it scans the live image descriptions
+    int fam_scale, fam = ups_family(t, depth, &fam_scale);   // it scans the live image descriptions
+    if (fam) return fam_scale;   // a family member follows its family's largest description
+    return nvn_ups_size_flags_ok((uint32_t)d.width, (uint32_t)d.height, t->d.flags, depth, g_ups);
 }
 // The factor a texture was made at: g_ups for one ups_pick took (its Metal texture is wider than the game's), else 1. mt may be a view of it (views keep the size)
 // (a texture description with no size, as the Vulkan / GL presents pass, counts as unscaled: those layers never scale)
@@ -3391,7 +3400,8 @@ static uint64_t g_texinfo_ser[8]; static int g_texinfo_n;
 // Single-description storage keeps the ordinary allocation. Families share an exact-sized placement heap, found through the existing alias table rather than a pool-lifetime owner.
 // Different formats, offsets, CPU-visible, sparse, linear, display, layered and multisample images keep their existing path. Inherited texels are not translated between incompatible
 // layouts: a changed layout is initialized by its GPU writer. Creating its descriptor must not zero another alias's live content in the earlier upload batch.
-static id<MTLTexture> image_texture(const tex_t *t, MTLTextureDescriptor *d) {
+// up: the family is scaled (ups_pick): d already has the scaled size, and the other members' descriptions are scaled the same way before the heap is sized for the largest
+static id<MTLTexture> image_texture(const tex_t *t, MTLTextureDescriptor *d, int up) {
     if (!image_shape(t) || !t->pool->mem || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || nvn_sparse_pool(t->pool)) return nil;
     MTLSizeAndAlign need = [g_dev heapTextureSizeAndAlignWithDescriptor:d];
     if (!need.size) return nil;
@@ -3411,6 +3421,7 @@ static id<MTLTexture> image_texture(const tex_t *t, MTLTextureDescriptor *d) {
         if (other->pool != t->pool || other->off != t->off || other->d.format != t->d.format) continue;
         family |= other->d.width != t->d.width || other->d.height != t->d.height;
         MTLTextureDescriptor *od = tex_desc(other, 0); if (!od) continue;
+        if (up) { od.width = ups_dim(od.width); od.height = ups_dim(od.height); }
         MTLSizeAndAlign sz = [g_dev heapTextureSizeAndAlignWithDescriptor:od];
         if (sz.size > capacity) { capacity = sz.size; largest = od; }
     }
@@ -3430,7 +3441,7 @@ static id<MTLTexture> image_texture(const tex_t *t, MTLTextureDescriptor *d) {
         // Initialize the whole family, including storage outside a first-used small resolution. Only a new heap is zeroed; later descriptors alias its existing bytes.
         id<MTLTexture> zero = largest == d ? mt : [owner->heap newTextureWithDescriptor:largest offset:0];
         if (!zero) return nil;
-        objc_setAssociatedObject(zero, &g_image_heap_owner_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC); tex_zero_fill(zero, 1);   // an image family is never scaled (ups_family): the plain fill cap
+        objc_setAssociatedObject(zero, &g_image_heap_owner_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC); tex_zero_fill(zero, up ? (double)g_ups * g_ups : 1);   // a scaled family: the fill cap follows the factor, as for any scaled texture
     }
     return mt;
 }
@@ -3596,7 +3607,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         if (!d) return nil;
         int up = ups_pick(t, d);   // resolution upscaling: a screen-like render target is made at its size × the factor
         if (up) { d.width = ups_dim(d.width); d.height = ups_dim(d.height); }
-        mt = up ? nil : image_texture(t, d);   // a scaled texture never joins an alias family (image_texture): its texels are not laid out at the game's size
+        mt = image_texture(t, d, up);   // an alias family's member, scaled or not with its whole family (ups_family); nil for a texture outside a family
         if (!mt) { mt = [g_dev newTextureWithDescriptor:d];
             if (mt) { res_add(mt); if (up || !tex_init_fill(t, mt)) tex_zero_fill(mt, up ? (double)g_ups * g_ups : 1); } }   // residency before the fill; a scaled one is not filled from its storage, whose layout is the game's size
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }

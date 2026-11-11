@@ -1032,6 +1032,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Check:** `make -C dm/gfx/tests GAME=<any> check_t_ups_resolve` (a 1200x675 viewport of a 1600x900 sRGB scene at 2x into 1920x1080 with each filter, under validation and on the encoding thread; `keep`, other constants, equal sizes and 1x leave the dispatch alone) and `t_ups` (the shape, the constants, the sizes).
 - **Found on:** [Hyrule Warriors: Age of Imprisonment](../../dm/games/04003F40232DE000/README.md#resolution-upscaling): KTGL's `b0fe425c26f12012`; shots of the first field at 1x, 2x with the game's kernel and 2x with the resolve.
 
+### Resolution upscaling leaves a dynamic-resolution game's 3D at its own size
+
+- **Symptom:** with resolution upscaling (`DM_UPSCALE=2`) the picture is twice as large and no sharper: the log names only the swap chain textures and a few small effect targets as "made" scaled, shows no demotion, and the 3D has the same stair-stepped edges as at 1x.
+- **Cause:** the game describes each scene render target at several sizes over one storage, as a game with dynamic resolution does: an alias family, whose members share one placement heap (`image_texture`). A scaled member could not join a heap made for the game's sizes, so every family stayed at the game's size.
+- **Fix:** a family is scaled as a whole or not at all (`ups_family`, `ups_pick`): it takes the answer of its largest live description, and `image_texture` sizes the family's heap for the scaled descriptions, so every member is made at its size times the factor in the same heap. A member smaller than the size rule's minimum is scaled with its family; a family whose largest member is not screen-like stays whole at the game's size; a single description is scaled alone, outside any heap.
+- **Check:** `make -C dm/gfx/tests GAME=<any> check_t_ups_family` (a 1600x900 / 1280x720 / 256x144 family, a family that is not screen-like and a single description, at 1x, 1.5x and 2x, above 1x under the Metal debug layer).
+- **Found on:** Bayonetta Origins: Cereza and the Lost Demon (`0100CF5010FEC000`, 1.0.0): all 13 of its 1600x900 scene targets (colour and depth, `COMPRESSIBLE | IMAGE`) are such families. At 2x on an M2 Pro they are made 3200x1800 with no demotion and the game holds its 30 fps; GPU time p50 about 11 ms headless (6.2 ms at 1x) and about 29 ms in a 2560x1440 window. The interface text is not sharper: it is drawn from bitmap textures.
+
 ### Metal 4 does not order operations inside one encoder
 
 - **Symptom:** tall blue / textured panels that flickered frame to frame: the fountain's vertex shader pushed the water surface to the top of the screen.

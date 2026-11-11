@@ -432,6 +432,15 @@ check_t_ups_resolve: t_ups_resolve
 	DM_NVN_ENC_THREAD=0 DM_UPSCALE=2 ./t_ups_resolve
 	DM_NVN_ENC_THREAD=1 DM_UPSCALE=2 ./t_ups_resolve
 	MTL_DEBUG_LAYER=1 DM_UPSCALE=2 ./t_ups_resolve
+# Resolution upscaling of alias families (render targets described at several sizes over one storage, as dynamic resolution does): at 1x, where nothing is
+# scaled, and at 1.5x and 2x under the Metal debug layer
+t_ups_family: t_ups_family.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_ups_family.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_ups_family
+check_t_ups_family: t_ups_family
+	DM_UPSCALE=1 ./t_ups_family
+	DM_UPSCALE=1.5 MTL_DEBUG_LAYER=1 ./t_ups_family
+	DM_UPSCALE=2 MTL_DEBUG_LAYER=1 ./t_ups_family
 	./t_ups_resolve
 # NVN2's DLSS on MetalFX's temporal scaler, with and without the encoding thread (MetalFX encodes into the real command buffer; validation stops its Metal 4 scalers, as above)
 t_dlss_mfx: t_dlss_mfx.m $(MTL_T_DEP)
