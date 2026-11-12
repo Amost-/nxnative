@@ -70,6 +70,7 @@ static void tf_draw(NvProg *pr,const p_draw *dw,const p_draw_idx *di) {
     id<MTL4RenderCommandEncoder> en=enc_r_begin(rd);enc_r_pso(en,ps);
     {int bad=bind_vbufs(en,&vs->rf);if(bad>=0){RED_ONCE(158,"vertex stream %d's buffer %#llx is in no memory pool; draw skipped",bad,(unsigned long long)S.vbuf[bad].address);enc_r_end(en);return;}}
     vconv_bind(en,vs,1,dw,NULL);
+    if(g_ups>1)g_ups_fs=nil;   // resolution upscaling: no fragment stage here, so the vertex entries start at render_scale[1]
     args_dirty_all();encode_args(en,vs,0,1);enc_r_vbuf(en,14,job);
     for(int b=0;b<4;b++)if(vs->tf_stride[b])enc_r_vbuf(en,TF_SLOT+b,dst[b]);
     enc_r_draw_instanced(en,MTLPrimitiveTypePoint,dw->first,dw->count,instances,dw->base_instance);enc_r_end(en);

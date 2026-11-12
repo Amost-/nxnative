@@ -78,6 +78,7 @@ def build(gid, patched, control):
         return macros[name].strip('"')
 
     def shown(cond, n):
+        if '&' in cond: return all(shown(c, n) for c in cond.split('&'))   # every joined condition must hold (gfxapi:nvn&platform:mac)
         if cond == 'always': return True
         if cond == 'languages>1': return len(langs) > 1
         if cond == 'switch2': return switch2(patched)
