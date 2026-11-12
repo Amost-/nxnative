@@ -1,7 +1,8 @@
 // A large memory pool in chunks (nvn_mtl.m BIG_MIN): a lookup gets a zero-copy buffer that holds what it asked and starts at its stride, so only what lookups reach is wired. The buffers must
 // say the same memory as the guest address, a read of unknown extent must have BIG_UNKNOWN past it, a chunk asked for more is lengthened, a texture's upload wires no chunk (up_big_src),
 // raw global memory's pool table covers the whole pool (big_full), the pool's removal takes every entry, a smaller pool stays one buffer, and each kind of pool buffer made over a
-// write-protected page still takes the GPU's writes without counting the page as written (pool_buf).
+// write-protected page still takes the GPU's writes without counting the page as written (pool_buf). A texture a shader read through the pool goes into a copy of the tables earlier
+// submissions bound, never into those tables themselves, which committed work may still be reading (pool_snap_fork).
 #include "../nvn/nvn_mtl.m"
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
@@ -110,8 +111,9 @@ int main(void) { @autoreleasepool {
         uint64_t r[2]; memcpy(r, map + (size_t)entry * DMSH_GMEM_MAP_ENTRY, sizeof r);
         CHECK("the entry holds the whole chunk", r[0] <= chunk << DMSH_GMEM_HINT_SHIFT && r[1] >= (chunk + 1) << DMSH_GMEM_HINT_SHIFT);
     }
-    // A texture a shader read is made, and goes into the table in place: no new table, and the budget does not apply. One nobody read is not made: its entry is its stand-in (pool_stand; the
-    // dummy with DM_NVN_POOL_STANDIN=0). A render target no pass has written stays the dummy
+    // A texture a shader read is made, whatever the budget, and goes into a copy of the table an earlier submission bound; that table keeps its stand-in (pool_stand; the dummy with
+    // DM_NVN_POOL_STANDIN=0), as its draws may still be on the GPU and the new texture is not resident for them. One nobody read is not made: its entry is its stand-in. A render
+    // target no pass has written stays the dummy
     {
         tex_t rd = {.magic = MAGIC('T', 'E', 'X', 0), .has_layout = 1, .serial = 99801}, un = rd, rt = rd;
         rd.d = (nvn_texdesc){.target = 1, .format = NVN_FORMAT_RGBA8, .width = 2048, .height = 2048, .depth = 1, .levels = 1, .samples = 1}; nvn_tex_layout(&rd.d, &rd.L);
@@ -131,11 +133,19 @@ int main(void) { @autoreleasepool {
         uint64_t was = e[301];   // its stand-in, or the dummy
         os_unfair_lock_unlock(&g_rmu); finish();
         ((uint32_t *)g_seen_buf.contents)[301 / 32] |= 1u << (301 % 32) | 1u << (303 % 32);
+        uint64_t forks0 = g_pool_forks, gen0 = g_psnap_gen;
         mtl_sub_begin(); os_unfair_lock_lock(&g_rmu);
+        pool_seen_scan();   // what pool_gpu does first; looked at on its own, before the walk pool_gpu then makes for the new texture
+        pool_snap *q = NULL; for (int k = 0; k < POOL_SNAPS; k++) if (g_psnap[k].buf && !g_psnap[k].samp && g_psnap[k].dtt == MTLTextureType2D && g_psnap[k].base == 0) q = &g_psnap[k];
+        CHECK("the scan copied the table", q && q->buf != tb && q->gpu == q->buf.gpuAddress && g_pool_forks == forks0 + 1 && g_psnap_gen != gen0);
+        const uint64_t *ec = q ? (const uint64_t *)((const uint8_t *)q->buf.contents + DMSH_POOL_HEAD) : e;
+        CHECK("the copy has the read texture", ec[301] != dummy && ec[301] != was);
+        CHECK("the copy keeps the other entries", q && UNREAD(ec, 302) && ec[303] == dummy && *(const uint32_t *)q->buf.contents == *(const uint32_t *)tb.contents);
+        CHECK("the table the last submission bound is left as it was", e[301] == was);
         pool_gpu(0, MTLTextureType2D, 0, 0, &tb2);
         const uint64_t *e2 = (const uint64_t *)((const uint8_t *)tb2.contents + DMSH_POOL_HEAD);
         CHECK("a read texture goes in, past the budget", g_treg[301].view && e2[301] == g_treg[301].view_rid && e2[301] != dummy);
-        CHECK("and into the table a draw already encoded reads", e[301] != dummy && e[301] != was && !g_treg[301].stand);
+        CHECK("still not into the table the last submission bound", e[301] == was && !g_treg[301].stand);
         CHECK("an unread one is still not made", UNREAD(e2, 302));
         CHECK("a read render target no pass wrote stays the dummy", e2[303] == dummy);
         os_unfair_lock_unlock(&g_rmu); finish();

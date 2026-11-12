@@ -49,7 +49,7 @@ def __getattr__(name) -> Any:   # MAC_MIN, MAC_MIN_FLAG and MAC_METAL as the mod
     if name == 'MAC_MIN_FLAG': return f'-mmacosx-version-min={mac_min()}'
     if name == 'MAC_METAL': return mac_metal()
     raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
-INPUT_TABLES = ['shader_facts.tsv', 'shader_map.tsv', 'shader_map.tsv.conflicts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv', 'bf_want.tsv', 'geo_mesh.tsv', 'dual_want.tsv']   # in the game profile folder
+INPUT_TABLES = ['shader_facts.tsv', 'shader_map.tsv', 'shader_map.tsv.conflicts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv', 'bf_want.tsv', 'geo_mesh.tsv', 'dual_want.tsv', 'shader_msl.py']   # in the game profile folder (shader_msl.py: the profile's own MSL rewrites, dmsh_build.py profile_msl)
 LOCK = os.path.join(HERE, 'dmsh_chain.lock'); HEADER = os.path.join(GFX, 'nvn/dmsh_chain.h')
 STAMP = 'inputs.tsv'   # in the library directory b-<V>/
 # the translator defaults to the in-repo build that matches the lock file (dm/tools/native_tools.sh; a rebuild has another fingerprint)

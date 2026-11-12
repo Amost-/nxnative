@@ -60,6 +60,8 @@ typedef struct {
     uint32_t epoch;                            // counts Stop / Flush: the pictures of a packet taken before one are dropped
     struct { uint8_t *data; uint64_t size; int64_t ts; uint8_t eos; } q[CV_HOLD]; uint32_t qhead, qcount;   // the packets taken and not yet decoded, in order (copies)
     cv_times st, all;                          // decode times of the current run of CV_STAT packets and of the runs before it
+    int clk_on, catching; int64_t clk_ts0, clk_last; double clk_t0; uint64_t skipped, restarts, catchups;   // AV1's movie clock (cv_skip_late): a picture's timestamp against the guest clock
+    uint64_t take_frame, take_wall;   // the presented-frame count and now_ns() when the game last took a picture (cv_pause)
 } cv_dec;
 
 static cv_dec *g_cv[16];
@@ -112,6 +114,48 @@ static void pool_native_write(cv_pool *p, uint32_t i, const vpx_image_t *im) {
     free(tmp);
 }
 static int cv_pending(const cv_dec *d) { return d->nheld + (int)d->qcount + d->busy; }   // what the decoder holds for the client: packets not yet decoded and pictures no released buffer has taken (decoder lock held)
+// A player that shows one picture a frame plays a 60 fps movie at the game's frame rate. Ocarina of Time's AV1 movies (all 60 fps) ran at 0.44x on an M1 Max whose GPU
+// gives the title 28 frames a second, with the sound running ahead. So a picture is given by the clock, as a video player does: the movie's timestamps (ns) from its first
+// picture against the guest clock, and of the waiting pictures the newest one that is due, the late ones before it dropped. A picture is late once the next is 50 ms overdue:
+// with no slack, a game at the movie's rate a frame behind its clock after a hitch skipped every other picture from then on. A timestamp going back (a loop, a new stream)
+// starts the clock again. So does a picture over a second late when the game held the movie: it presented frames without taking a picture (a pause menu, a load screen) or
+// its window lost the focus meanwhile (cv_pause). Otherwise the whole game stood still in the host (a pipeline built on first use, a long GPU wait) while its sound went on,
+// and the late pictures are skipped until the movie is back on its clock: starting the clock again there left the picture behind the narration until the next stream (an M2
+// Pro's title movie). The clock is the guest's (guest_ns), which does not run while the Mac sleeps, while an iPhone app is in the background or under DM_DETCLOCK's replay
+// steps, so none of those makes a gap. A game that keeps up drops nothing. AV1 only (the only timestamps checked); DM_CV_LATE=0 turns it off
+static double cv_now(void) { return (double)guest_ns() / 1e9; }
+static double (*cv_clock)(void) = cv_now;   // t_codec_video replaces it
+static int cv_late_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_CV_LATE"); v = !(e && !strcmp(e, "0")); } return v; }
+#define CV_PAUSE_FRAMES 6   // frames presented without a picture taken that make a gap the game's: a stall in the host presents at most the frame it held, plus the frames
+                            // a movie slower than the game skips between pictures
+static const char *cv_pause(const cv_dec *d) {
+    if (dm_guest_frame() - d->take_frame >= CV_PAUSE_FRAMES) return "the game presented frames without taking a picture";
+    if (dm_focus_now() != 1 || dm_focus_in_since() > d->take_wall) return "the window lost the focus";
+    return NULL;
+}
+static void cv_skip_late(cv_dec *d) {   // decoder lock held, at least one picture waiting
+    double now = cv_clock(); int64_t ts = d->held_ts[0];
+    double late = d->clk_on ? now - (d->clk_t0 + (double)(ts - d->clk_ts0) / 1e9) : 0;
+    const char *why = !d->clk_on ? "" : ts < d->clk_last ? "a timestamp went back (a loop or a new stream)" : late > 1.0 ? cv_pause(d) : NULL;
+    if (why) {
+        if (*why && d->restarts++ < 8) {
+            if (ts < d->clk_last) LOG("[codec] %s decoder %u: the movie clock starts again: %s", k_cv_name[d->codec], d->id, why);
+            else LOG("[codec] %s decoder %u: the movie clock starts again, %.2f s behind: %s", k_cv_name[d->codec], d->id, late, why);
+        }
+        d->clk_on = 1; d->clk_ts0 = ts; d->clk_t0 = now; d->catching = 0; return;
+    }
+    if (late <= 1.0) d->catching = 0;
+    else if (!d->catching) {
+        d->catching = 1;
+        if (d->catchups++ < 8) LOG("[codec] %s decoder %u: %.2f s behind after the game stood still: late pictures skipped to catch up with the movie's clock", k_cv_name[d->codec], d->id, late);
+    }
+    while (d->nheld > 1 && !d->held_eos[0] && d->clk_t0 + (double)(d->held_ts[1] - d->clk_ts0) / 1e9 <= now - 0.05) {   // the next one is overdue too: this one is late
+        vpx_img_free(d->held[0]); d->nheld--;
+        memmove(d->held, d->held + 1, (size_t)d->nheld * sizeof d->held[0]); memmove(d->held_ts, d->held_ts + 1, (size_t)d->nheld * sizeof d->held_ts[0]);
+        memmove(d->held_eos, d->held_eos + 1, (size_t)d->nheld * sizeof d->held_eos[0]);
+        if (!d->skipped++) LOG("[codec] %s decoder %u: late pictures skipped to keep the movie on its clock (the game shows fewer pictures a second than the movie has)", k_cv_name[d->codec], d->id);
+    }
+}
 // Pictures and end of stream into the released buffers, in order (decoder lock held). decoded: the decoder's thread calls, with the pictures of the packet it has just decoded:
 // a buffer they go into was waiting for them
 static void fill(cv_dec *d, int decoded) {
@@ -119,11 +163,12 @@ static void fill(cv_dec *d, int decoded) {
     while (d->pcount && (d->nheld || d->eos_pending)) {
         uint32_t i = d->pend[d->phead]; d->phead = (d->phead + 1) % CV_BUFS; d->pcount--;
         typeof(d->buf[0]) *b = &d->buf[i];
+        if (d->nheld && d->codec == CV_AV1 && cv_late_on()) cv_skip_late(d);
         if (d->nheld) {
             vpx_image_t *im = d->held[0]; int64_t ts = d->held_ts[0]; uint8_t eos = d->held_eos[0];
             memmove(d->held, d->held + 1, sizeof d->held[0] * (CV_HOLD - 1)); memmove(d->held_ts, d->held_ts + 1, sizeof d->held_ts[0] * (CV_HOLD - 1));
             memmove(d->held_eos, d->held_eos + 1, CV_HOLD - 1); d->nheld--;
-            b->w = (uint16_t)im->d_w; b->h = (uint16_t)im->d_h; b->ts = ts; b->eos = eos;
+            b->w = (uint16_t)im->d_w; b->h = (uint16_t)im->d_h; b->ts = ts; b->eos = eos; d->clk_last = ts; d->take_frame = dm_guest_frame(); d->take_wall = now_ns();
             if (b->pool && b->pidx < b->pool->count) { pool_native_write(b->pool, b->pidx, im); if (b->pool->img[b->pidx]) vpx_img_free(b->pool->img[b->pidx]); b->pool->img[b->pidx] = im; } else vpx_img_free(im);
             if (!d->pictures++) LOG("[codec] %s decoder %u: first picture %ux%u into buffer %u", k_cv_name[d->codec], d->id, b->w, b->h, i);
             if (decoded) d->st.late++;
@@ -355,7 +400,7 @@ static Result cv_dec_reset(void *t) {
     for (uint32_t k = 0; k < d->qcount; k++) free(d->q[(d->qhead + k) % CV_HOLD].data);
     d->qhead = d->qcount = 0;
     for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]);
-    d->nheld = 0; d->eos_pending = 0;
+    d->nheld = 0; d->eos_pending = 0; d->clk_on = 0;
     d->epoch++; d->reopen = 1;
     cv_stat_sum(d);
     pthread_cond_signal(&d->work);   // it may have waited for room

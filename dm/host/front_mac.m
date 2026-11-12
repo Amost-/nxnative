@@ -11,6 +11,7 @@
 // DM_PAD_MERGE=1 merges every controller into player 1 instead, DM_KBD_PLAYER=own makes the keyboard player 1 on its own, with the controllers from player 2 on.
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <stdatomic.h>
 #import <Metal/Metal.h>
 #import <GameController/GameController.h>
 #include "dm.h"
@@ -36,6 +37,40 @@ static void merge_rumble_to_s2(int on);
 #include <sys/stat.h>
 
 static CAMetalLayer *g_layer;
+// Whether the window's screen can show EDR at all (its potential headroom is above 1; hle_vi.c answers HDR only then): -1 until the first read, taken as yes.
+// Read four times a second on the main thread while the HDR layer is on, so it follows the window to another screen (an external SDR monitor beside the built-in XDR screen)
+static _Atomic int g_hdr_screen = -1;
+int front_hdr_screen(void) { return atomic_load(&g_hdr_screen) != 0; }
+// The screen's current EDR headroom (maximumExtendedDynamicRangeColorComponentValue), read with the potential one: hle_vi.c's automatic peak (DM_HDR_PEAK=auto) is the paper white times it.
+// 1.0 until the first read and without the HDR layer. The system grants the headroom while the window is in front, whatever range the game declares, so the automatic peak does not
+// hold itself down: on the XDR panel it read 1.2 when the layer was made and 16 by the game's first query, then followed the brightness slider both ways (16 at low brightness,
+// 3.2 = 1600 / 500 nits at full). In a window behind others it stays at 1.2 with any declared range. Polled, as the system offers no notification for it; the game asks every frame,
+// so a change reaches it within a quarter second
+static _Atomic float g_hdr_headroom = 1.0f;
+float front_hdr_headroom(void) { return atomic_load(&g_hdr_headroom); }
+static void front_hdr_screen_read(NSScreen *s) {
+    atomic_store(&g_hdr_headroom, (float)s.maximumExtendedDynamicRangeColorComponentValue);
+    double pot = s.maximumPotentialExtendedDynamicRangeColorComponentValue;
+    int can = pot > 1.0;
+    if (atomic_exchange(&g_hdr_screen, can) != can) LOG("front end: the window's screen %s EDR (%s, potential headroom %.2f)", can ? "can show" : "cannot show", s.localizedName.UTF8String, pot);
+}
+// The HDR layer's HDR10 metadata (CAEDRMetadata): Core Animation maps the layer's range into the screen's current headroom by it. The range is the one the game declares
+// (0 to 1000 nits until it says, hle_vi.c front_hdr_content_range). opticalOutputScale (the paper white: 1.0 in the layer) applies to the float layer only (DM_HDR_LAYER=float):
+// for a normalized format such as the PQ layer's RGB10A2, Core Animation takes it as 10,000 (CAEDRMetadata.h), so PQ codes are absolute nits. Chosen over a roll-off of the host's own: on
+// Mario Kart World the two looked alike, reached the screen in the same time, and the system's follows brightness and the screen's modes as the rest of macOS does
+static int g_hdr_meta;   // the layer has the metadata (DM_HDR, and CAEDRMetadata is available)
+static _Atomic uint32_t g_hdr_range = 1000u << 16;   // the declared range: low nits in bits 0-15, high in 16-31
+static void front_hdr_metadata(void) {   // main thread
+    uint32_t r = atomic_load(&g_hdr_range);
+    g_layer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithMinLuminance:(float)(r & 0xffff) maxLuminance:(float)(r >> 16) opticalOutputScale:dm_hdr_paper_white()];
+}
+void front_hdr_content_range(unsigned lo, unsigned hi) {
+    if (!g_hdr_meta || hi <= lo || hi > 65535) return;
+    uint32_t r = lo | hi << 16;
+    if (atomic_exchange(&g_hdr_range, r) == r) return;
+    LOG("front end: HDR10 metadata: the game's range %u..%u nits", lo, hi);
+    dispatch_async(dispatch_get_main_queue(), ^{ front_hdr_metadata(); });
+}
 static uint64_t g_btn;
 static int g_w, g_a, g_s, g_d;
 static int g_rl, g_ru, g_rr, g_rd;   // arrow keys pressed with Shift held: the right stick (each goes back up as it went down, whatever Shift does meanwhile)
@@ -1528,6 +1563,24 @@ void front_run(void (*guest)(void)) {
         g_layer = [CAMetalLayer layer];
         g_layer.device = MTLCreateSystemDefaultDevice();
         g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        // DM_HDR=1 (the HDR mode): an HDR layer whatever the window's screen, with HDR10 metadata: Core Animation maps the picture into the screen's headroom, and a screen without
+        // headroom shows the SDR range. The layer is RGB10A2 in BT.2100 PQ (hle_vi.c dm_hdr_layer_float): the game's HDR10 window goes in as it is, an SDR source is encoded as HDR10 at the
+        // paper white (nvn_mtl.m present_mode). DM_HDR_LAYER=float keeps the RGBA16Float extended linear BT.2020 layer (present.metal fs_linear), which showed black blocks with coloured
+        // squares in them over flat areas (Mario Kart World's water on the course map), now and then and after the window came back to the front, on a MacBook Air M5 (macOS 27.0.1)
+        if (getenv("DM_HDR") && atoi(getenv("DM_HDR"))) {
+            int pq = !dm_hdr_layer_float();
+            g_layer.pixelFormat = pq ? MTLPixelFormatRGB10A2Unorm : MTLPixelFormatRGBA16Float;
+            CGColorSpaceRef ecs = CGColorSpaceCreateWithName(pq ? kCGColorSpaceITUR_2100_PQ : kCGColorSpaceExtendedLinearITUR_2020);
+            g_layer.colorspace = ecs; CGColorSpaceRelease(ecs);
+            g_layer.wantsExtendedDynamicRangeContent = YES;
+            if (CAEDRMetadata.available) { g_hdr_meta = 1; front_hdr_metadata(); }
+            else LOG("[RED] front end: no EDR metadata on this Mac (CAEDRMetadata): values above the screen's headroom clip");
+            if (atoi(getenv("DM_HDR")) == 2) win.title = [win.title stringByAppendingString:@" (DM_HDR=2: HDR on any screen)"];   // told apart from the setting's DM_HDR=1
+            LOG("front end: HDR output on (DM_HDR): the window's layer is %s%s; the screen's headroom %.2f now, at most %.2f", pq ? "RGB10A2 in BT.2100 PQ" : "RGBA16Float in extended linear BT.2020 (DM_HDR_LAYER=float)", g_hdr_meta ? ", with HDR10 metadata" : "",
+                (win.screen ?: NSScreen.mainScreen).maximumExtendedDynamicRangeColorComponentValue, (win.screen ?: NSScreen.mainScreen).maximumPotentialExtendedDynamicRangeColorComponentValue);
+            front_hdr_screen_read(win.screen ?: NSScreen.mainScreen);
+            [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) { (void)t; front_hdr_screen_read(win.screen ?: NSScreen.mainScreen); }];
+        }
         g_layer.contentsScale = win.backingScaleFactor;
         // Apple's HUD over the game (frame rate, frame and GPU time, memory): front_hud_env turns it on before the first device. The layer's developerHUDProperties
         // stay unset: mode=default forces this layer's HUD on, so the Metal HUD menu's Hide HUD left it on screen

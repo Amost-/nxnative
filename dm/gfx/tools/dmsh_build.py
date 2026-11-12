@@ -49,6 +49,23 @@ BF_WANT_FILE = str(GAME.table('bf_want.tsv'))
 BF_WANT = {line.strip() for line in open(BF_WANT_FILE) if line.strip() and not line.lstrip().startswith('#')} if os.path.exists(BF_WANT_FILE) else set()
 DUAL_WANT_FILE = str(GAME.table('dual_want.tsv'))   # pixel shaders a pipeline blends with their output 1 as the second source (see fs_dual), produced by the host (DM_NVN_DUAL_WANT)
 DUAL_WANT = {line.split()[0] for line in open(DUAL_WANT_FILE) if line.strip() and not line.lstrip().startswith('#')} if os.path.exists(DUAL_WANT_FILE) else set()
+# A profile's own MSL rewrites, dm/games/<id>/shader_msl.py (optional): REWRITES maps a shader key (dm_ctl_sha16) to a function taking the shader's finished MSL and returning the MSL to
+# compile. They are for a shader whose translation is right and whose arithmetic the port wants different (Ocarina of Time's HDR tone mapping, which stretches a clipped SDR picture); a
+# translation error is fixed in the chain instead. finish() applies one after border_emu and frag_z_snap and before uniform_tests and blend_zero, so it reads the translated locals under the names the cache's MSL has (<key>_b.metal) and must keep the
+# entry point's interface (bindings, inputs, outputs): the reflection is made from the rewritten source, but the host and the paired shaders expect the original's. A rewrite raises ValueError
+# when the source is not the one it was written for, which fails that shader instead of compiling something else. The file's bytes are in the cache key of each shader it names (shader_key) and
+# in the profile's inputs digest (dmsh_chain.INPUT_TABLES).
+def profile_msl(path):
+    """→ ({shader key: rewrite function}, the file's bytes) of a profile's shader_msl.py; ({}, b'') when the profile has none. A key that is not 16 hex digits or a value that is not
+    callable stops the build: a mistyped key would otherwise leave its shader as the game's with no message"""
+    if not os.path.exists(path): return {}, b''
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('dm_profile_shader_msl', path); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    rewrites = dict(getattr(mod, 'REWRITES', {}))
+    bad = [k for k, f in rewrites.items() if not (isinstance(k, str) and re.fullmatch(r'[0-9a-f]{16}', k) and callable(f))]
+    if bad: sys.exit(f'[RED] {os.path.abspath(path)}: REWRITES needs 16-hex-digit shader keys mapped to functions, not {bad}')
+    with open(path, 'rb') as f: return rewrites, f.read()
+PROFILE_MSL, PROFILE_MSL_SRC = profile_msl(str(GAME.table('shader_msl.py')))
 XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-texture-buffer-native', '--msl-pad-fragment-output']
 
 STORE: 'shader_cache.Store | shader_cache.Remote' = shader_cache.Store(os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas.db')))
@@ -114,7 +131,8 @@ def shader_key(key, name, rec):
     payload = (b'record\0' + rec + b'\0map\0' + map_row + b'\0pc\0' + pc +
                b'\0tools\0' + TOOL_FP + b'\0code\0' + CODE_FP.encode() +
                b'\0rule\0' + shader_rule_source(name) + b'\0profile\0' + PROFILE_ROWS + b'\0pairs\0' + ','.join(sorted(PAIRS.get(key, ()))).encode() +
-               b'\0dual\0' + (b'1' if key in DUAL_WANT else b'0'))   # fs_dual emits another entry point for listed shaders; the cache must track that choice
+               b'\0dual\0' + (b'1' if key in DUAL_WANT else b'0') +   # fs_dual emits another entry point for listed shaders; the cache must track that choice
+               b'\0msl\0' + (PROFILE_MSL_SRC if key in PROFILE_MSL else b''))   # the profile's rewrite of this shader (profile_msl): its file's bytes, as a rewrite may use anything in it
     return hashlib.sha256(payload).hexdigest()
 def pair_keyed(digest, pixel_digests):   # a vertex shader's key with its pixel shaders' keys (vs_pad)
     return hashlib.sha256((digest + '\0' + ','.join(pixel_digests)).encode()).hexdigest()
@@ -773,6 +791,9 @@ def finish(key, w, j, c1):
     src = dmsh_rewrite.tg_fence(src)   # warp-synchronous shared memory: a simdgroup-scope fence after each threadgroup store (see tg_fence)
     src = dmsh_rewrite.border_emu(src)   # border colours Metal lacks (see border_emu)
     if j['stage'] == 'ps': src = dmsh_rewrite.frag_z_snap(src)[0]   # gl_FragCoord.z against a depth of its own surface (see frag_z_snap)
+    if key in PROFILE_MSL:   # the profile's own rewrite of this shader (see profile_msl): after the rewrites that leave the translated locals as they are, before those that rewrite uniform tests and blends
+        try: src = PROFILE_MSL[key](src)
+        except ValueError as e: return 'profile MSL rewrite failed', str(e)[:160], None
     try: src = dmsh_rewrite.uniform_tests(src)   # a uniform word tested against constants read by a volatile load per test, so the front end folds no switch (see uniform_tests)
     except ValueError as e: return 'uniform tests rewrite failed', str(e)[:160], None
     blend0 = 0
